@@ -1,0 +1,12 @@
+# SysAI defaults. The installer copies this to ~/.config/sysai/config.toml.
+model = "qwen3:8b"
+ollama_url = "http://127.0.0.1:11434"
+auto_analyze_failures = true
+output_capture_bytes = 48000
+context_commands = 8
+verbosity = "concise"
+thinking = false
+web_enabled = false
+web_provider = "ollama"
+request_timeout_seconds = 120
+startup_timeout_seconds = 20

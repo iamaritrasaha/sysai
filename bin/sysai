@@ -1,0 +1,12 @@
+#!/bin/sh
+set -eu
+SYSAI_SCRIPT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/sysai
+SYSAI_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+if [ -d "$SYSAI_ROOT/src/sysai" ]; then
+  SYSAI_PYTHONPATH="$SYSAI_ROOT/src"
+else
+  SYSAI_PYTHONPATH="${SYSAI_LIB_DIR:-$SYSAI_ROOT/lib/sysai-terminal}"
+fi
+export SYSAI_EXECUTABLE="$SYSAI_SCRIPT"
+export PYTHONPATH="$SYSAI_PYTHONPATH${PYTHONPATH:+:$PYTHONPATH}"
+exec python3 -m sysai "$@"

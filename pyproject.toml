@@ -1,0 +1,12 @@
+[project]
+name = "sysai-terminal"
+version = "0.1.0"
+description = "A safe, local AI assistant for interactive Zsh sessions"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+
+[project.scripts]
+sysai = "sysai.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install Zsh
+        run: sudo apt-get update && sudo apt-get install --yes zsh
+      - name: Unit tests
+        run: PYTHONPATH=src python -m unittest discover -s tests -v
+      - name: Python syntax
+        run: python -m compileall -q src tests
+      - name: Shell syntax
+        run: |
+          sh -n bin/sysai install.sh uninstall.sh scripts/manual-integration-test.sh
+          zsh -n src/sysai/integration.zsh
+      - name: Isolated install and uninstall
+        run: |
+          install_root=$(mktemp -d)
+          config_root=$(mktemp -d)
+          SYSAI_INSTALL_ROOT="$install_root" XDG_CONFIG_HOME="$config_root" ./install.sh
+          "$install_root/bin/sysai" --version
+          "$install_root/bin/sysai" --help
+          SYSAI_INSTALL_ROOT="$install_root" XDG_CONFIG_HOME="$config_root" ./uninstall.sh
+          test ! -e "$install_root/bin/sysai"
+          test -e "$config_root/sysai/config.toml"
+      - name: Whitespace check
+        run: git diff --check "$(git hash-object -t tree /dev/null)" HEAD

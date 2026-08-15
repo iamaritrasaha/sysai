@@ -1,0 +1,41 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+.tox/
+.nox/
+dist/
+build/
+*.egg-info/
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+config/env
+config/*.local.toml
+config/config.toml
+*.pem
+*.key
+
+# Terminal/session data and runtime state
+captures/
+sessions/
+runtime/
+*.session
+*.transcript
+*.typescript
+active.json
+ollama.log
+*.sock
+
+# Editors and operating systems
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
