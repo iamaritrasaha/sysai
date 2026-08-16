@@ -16,4 +16,3 @@ zsh -n src/sysai/integration.zsh
 Run `scripts/manual-integration-test.sh` separately when a local Ollama server and the configured model are available.
 
 Keep changes focused, add tests for behavior changes, and never add captured transcripts, credentials, local configuration, or runtime state. Changes must preserve the rule that model output is advice only and is never executed.
-

@@ -31,4 +31,3 @@ function sysai() {
   fi
   command "$SYSAI_EXECUTABLE" "$@"
 }
-
