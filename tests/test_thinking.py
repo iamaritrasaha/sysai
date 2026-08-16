@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import socket
 import threading
 import unittest
@@ -236,13 +237,188 @@ class AnswerRendererTests(unittest.TestCase):
 
 
 class StreamBoxTests(unittest.TestCase):
-    def test_long_line_without_newline_still_flushes_live(self):
+    def _render(self, text, columns=48, chunks=None):
         written = []
-        box_stream = StreamBox(written.append, "SysAI · thinking", dim=True)
-        box_stream.feed("x" * 200)
-        # Flushed before close() because it exceeded the live-flush threshold.
-        self.assertTrue(any("x" * 100 in chunk for chunk in written))
-        box_stream.close()
+        with mock.patch("sysai.display.shutil.get_terminal_size", return_value=os.terminal_size((columns, 24))):
+            box_stream = StreamBox(written.append, "SysAI")
+            for chunk in chunks or [text]:
+                box_stream.feed(chunk)
+            box_stream.close()
+        return "".join(written)
+
+    def test_markdown_and_heading_underline_stay_inside_box(self):
+        text = self._render("**1. System Overview**\n### Filesystem Mounts\n**Warning** Run `systemctl --failed`\n")
+        self.assertNotIn("**", text)
+        self.assertNotIn("`", text)
+        self.assertIn("│ 1. System Overview", text)
+        self.assertIn("│ Filesystem Mounts", text)
+        self.assertIn("│ ─────────────────", text)
+
+    def test_real_bold_heading_regression_and_final_delimiter_guard(self):
+        text = self._render("**Key ACPI Tables in the Log**\n1. SSDT (Secondary System Description Table)\n   • Multiple SSDT entries...\n**Warning: `foo` failed**\n__Warning__\n")
+        self.assertIn("Key ACPI Tables in the Log", text)
+        self.assertIn("Warning: foo failed", text)
+        self.assertIn("Warning", text)
+        self.assertNotIn("**Key ACPI Tables in the Log**", text)
+        self.assertNotIn("**", text)
+        self.assertNotIn("__", text)
+        self.assertNotIn("`", text)
+        self.assertIn("│ ─", text)
+        self.assertIn("│    • Multiple SSDT entries...", text)
+
+    def test_bold_split_across_chunks_and_fenced_code_is_preserved(self):
+        text = self._render("", chunks=["**Key ACPI", " Tables**\n```bash\necho '**literal**'\n```\n"])
+        self.assertIn("│ Key ACPI Tables", text)
+        self.assertIn("│ echo '**literal**'", text)
+
+    def test_long_content_wraps_with_prefix_and_indentation(self):
+        text = self._render("• External Drive: " + "explanation " * 20 + "\n  indented " + "detail " * 20 + "\n", columns=36)
+        content = [line for line in text.splitlines() if line.startswith("│")]
+        self.assertGreater(len(content), 4)
+        self.assertTrue(all(len(line) <= 35 for line in content))
+        self.assertTrue(all(line.startswith("│") for line in content))
+        self.assertTrue(any(line.startswith("│   ") for line in content))
+
+    def test_split_markdown_fence_and_narrow_terminal(self):
+        text = self._render("", columns=12, chunks=["**Syst", "em**\n```ba", "sh\nsudo apt update\n```\n"])
+        self.assertIn("│ System", text)
+        self.assertIn("│ sudo", text)
+        self.assertNotIn("**", text)
+        self.assertNotIn("```", text)
+        self.assertTrue(all(len(line) <= 11 for line in text.splitlines()))
+
+    def test_control_injection_and_no_color_are_clean(self):
+        with mock.patch.dict(os.environ, {"NO_COLOR": "1"}, clear=False):
+            text = self._render("safe\x1b[31m**bold**\x1b[0m\x1bPmalicious\x1b\\\x9b\nnext\rline\n", columns=30)
+        self.assertIn("safebold", text)
+        self.assertNotIn("\x1b", text)
+        self.assertNotIn("\x9b", text)
+        self.assertIn("│ next", text)
+        self.assertIn("│ line", text)
+
+    def test_reasoning_control_tokens_do_not_leak_but_code_is_preserved(self):
+        text = self._render("Summary /think\n/no_think\n```text\n/think\n```\n")
+        self.assertIn("Summary", text)
+        self.assertNotIn("Summary /think", text)
+        self.assertNotIn("│ /no_think", text)
+        self.assertIn("│ /think", text)
+
+    def test_escaped_markdown_is_normalized_outside_code(self):
+        source = (
+            r"\*\*Key Observations from the Log\*\*" "\n"
+            r"\---" "\n"
+            r"1\. ACPI Table Reservations:" "\n"
+            r"\__Potential Issues and Solutions\__" "\n"
+            r"2\. \*\*ACPI Table Conflicts\*\*" "\n"
+            r"\*\*Summary\*\*" "\n"
+            r"Run \`systemctl --failed\`." "\n"
+            "```text\n" r"grep \* /var/log" "\n```\n"
+        )
+        with mock.patch.dict(os.environ, {"NO_COLOR": "1"}, clear=False):
+            text = self._render(source, columns=44)
+        for expected in ("Key Observations from the Log", "1. ACPI Table Reservations:",
+                         "Potential Issues and Solutions", "2. ACPI Table Conflicts", "Summary",
+                         "Run systemctl --failed.", r"grep \* /var/log"):
+            self.assertIn(expected, text)
+        for leaked in (r"\*\*", r"\__", r"\---", r"1\.", r"2\."):
+            self.assertNotIn(leaked, text)
+        model_lines = [line for line in text.splitlines() if line and not line.startswith(("┌", "└"))]
+        self.assertTrue(all(line.startswith("│") for line in model_lines))
+
+    def test_escaped_markdown_split_across_chunks(self):
+        text = self._render("", chunks=[r"\*", r"\*Head", r"ing\*", "\\*\n"])
+        self.assertIn("│ Heading", text)
+        self.assertNotIn(r"\*\*", text)
+
+    def test_inline_markdown_and_horizontal_rule_regression(self):
+        source = """Analysis of `dmesg` Output
+
+---
+
+1. **GPU (AMDGPU) Related Messages**
+   • **REG_WAIT timeout:** Driver warning.
+
+2. **AppArmor Security Denials**
+   • This is **normal enforcement** in this context.
+
+---
+
+**Summary**
+Run `grep '\\*\\*foo\\*\\*' file`
+```bash
+echo '**literal**'
+grep '\\*\\*foo\\*\\*' file
+```
+"""
+        text = self._render(source, columns=72)
+        for expected in ("Analysis of dmesg Output", "1. GPU (AMDGPU) Related Messages", "REG_WAIT timeout:",
+                         "2. AppArmor Security Denials", "normal enforcement", "Summary",
+                         r"grep '\*\*foo\*\*' file"):
+            self.assertIn(expected, text)
+        non_code = "\n".join(line for line in text.splitlines()
+                             if "echo '**literal**'" not in line and r"grep '\*\*foo\*\*' file" not in line)
+        for leaked in ("**", "`dmesg`", "---", "**Summary**"):
+            self.assertNotIn(leaked, non_code)
+        model_lines = [line for line in text.splitlines() if line and not line.startswith(("┌", "└"))]
+        self.assertTrue(all(line.startswith("│") for line in model_lines))
+
+    def test_inline_markdown_split_across_chunks(self):
+        text = self._render("", chunks=["1. **GPU ", "(AMDGPU) Rela", "ted Messages**\n", "Analysis of `dme", "sg` Output\n", "--", "-\n"])
+        self.assertIn("1. GPU (AMDGPU) Related Messages", text)
+        self.assertIn("Analysis of dmesg Output", text)
+        self.assertNotIn("**", text)
+        self.assertNotIn("---", text)
+
+    def test_backslash_escape_real_world_examples(self):
+        """Regression: Markdown punctuation escapes from real dmesg analysis output."""
+        source = (
+            r"1\. AppArmor Denials \(Security Restrictions\)" + "\n"
+            r"• capabilities such as perfmon, setpcap, and net\_admin." + "\n"
+            r"• ubuntu\_pro\_esm\_cache" + "\n"
+            r"• integrity: Error adding keys to platform keyring UEFI\:db" + "\n"
+            r"• REG\_WAIT timeout" + "\n"
+            r"• svm\_range\_deferred\_list\_work" + "\n"
+            r"• \>10000us" + "\n"
+            r"• ACPI: \_PSL evaluation failure" + "\n"
+            "```bash\n" + r"grep '\>10000' /var/log/kern.log" + "\n```\n"
+        )
+        with mock.patch.dict(os.environ, {"NO_COLOR": "1"}, clear=False):
+            text = self._render(source, columns=80)
+        # Backslash escapes must be cleaned outside code blocks
+        for expected in (
+            "1. AppArmor Denials (Security Restrictions)",
+            "net_admin",
+            "ubuntu_pro_esm_cache",
+            "UEFI:db",
+            "REG_WAIT timeout",
+            "svm_range_deferred_list_work",
+            ">10000us",
+            "_PSL evaluation failure",
+        ):
+            self.assertIn(expected, text, f"Expected clean form {expected!r}")
+        # Code block contents must be preserved literally
+        self.assertIn(r"grep '\>10000' /var/log/kern.log", text)
+        # None of these escaped forms should appear in the rendered output
+        for escaped in (r"net\_admin", r"UEFI\:db", r"\>10000us", r"\_PSL", r"1\."):
+            self.assertNotIn(escaped, text, f"Escaped form {escaped!r} leaked into output")
+
+    def test_backslash_escape_split_across_chunks(self):
+        """Escape sequences that straddle chunk boundaries are handled correctly."""
+        chunks = [r"net\_", "admin\n", r"UEFI\:", "db\n", r"\>", "10000us\n"]
+        with mock.patch.dict(os.environ, {"NO_COLOR": "1"}, clear=False):
+            text = self._render("", chunks=chunks)
+        self.assertIn("net_admin", text)
+        self.assertIn("UEFI:db", text)
+        self.assertIn(">10000us", text)
+
+    def test_mid_word_underscore_not_rendered_as_italic(self):
+        """Package names and identifiers with underscores must not be italicised."""
+        source = "ubuntu_pro_esm_cache and net_admin and svm_range_deferred_list_work\n"
+        with mock.patch.dict(os.environ, {"NO_COLOR": "1"}, clear=False):
+            text = self._render(source, columns=80)
+        self.assertIn("ubuntu_pro_esm_cache", text)
+        self.assertIn("net_admin", text)
+        self.assertIn("svm_range_deferred_list_work", text)
 
 
 class SessionThinkingIntegrationTests(unittest.TestCase):
@@ -257,6 +433,29 @@ class SessionThinkingIntegrationTests(unittest.TestCase):
             session._handle_event({"event": "complete", "status": 0, "cwd": "/tmp"}, 42)
         ask.assert_not_called()
         self.assertIsNone(session._analysis_thread)
+
+    def test_insight_prompt_marks_sysai_truncation_and_normal_acpi_as_informational(self):
+        session = self._session()
+        captured = {}
+
+        def ask(prompt, **kwargs):
+            captured["prompt"] = prompt
+            return "No significant issue identified in the analyzed evidence."
+
+        connection = mock.Mock()
+        result = {
+            "exit_code": 0, "truncated": True,
+            "output": "ACPI: RSDP 0x00000000\nACPI: Reserving FACP table\nACPI: APIC table found\n",
+        }
+        with mock.patch.object(session, "_ask_local", side_effect=ask):
+            session._control_stream({"action": "insight", "argv": ["dmesg"], "result": result}, connection)
+        prompt = captured["prompt"]
+        self.assertIn('"output_truncated": true', prompt)
+        self.assertIn('"truncation_reason": "SysAI bounded capture limit"', prompt)
+        self.assertIn("intentionally truncated by SysAI", prompt)
+        self.assertIn("NOT evidence that the operating system, boot process, kernel", prompt)
+        self.assertIn("Normal hardware/firmware enumeration, AppArmor enforcement", prompt)
+        self.assertIn("No significant problem identified in the analyzed evidence", prompt)
 
     def test_failed_commands_still_trigger_diagnosis(self):
         session = self._session()

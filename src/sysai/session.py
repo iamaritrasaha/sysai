@@ -8,6 +8,7 @@ import fcntl
 import json
 import os
 import pty
+import re
 import selectors
 import shlex
 import signal
@@ -19,6 +20,9 @@ from pathlib import Path
 
 from .config import Config, load_private_env, state_dir
 from .display import AnswerRenderer, plain_terminal_text, startup
+from .health import (action_catalogue, action_details, collect_health, parse_action_plan,
+                     run_action, safety_floor_actions, trusted_inventory, web_queries)
+from .insight import meaningful_anomaly, prepare_evidence, safe_research_query
 from .ollama import OllamaCancelled, OllamaError, OllamaManager, StreamHandle
 from .prompt import failure_prompt, system_prompt
 from .redact import redact, truncate_output
@@ -145,7 +149,9 @@ class Session:
                             if received > 1_000_000:
                                 raise ValueError("Session request exceeds 1 MB")
                             chunks.append(chunk)
-                        request = json.loads(b"".join(chunks) or b"{}")
+                            if b"\n" in chunk:
+                                break
+                        request = json.loads((b"".join(chunks).partition(b"\n")[0]) or b"{}")
                     except Exception as exc:
                         try:
                             conn.sendall(json.dumps({"ok": False, "error": str(exc)}).encode())
@@ -155,7 +161,7 @@ class Session:
                     # `explain`/`ask` stream multiple newline-delimited JSON
                     # messages (thinking/content/done) as the model
                     # generates; everything else is a single request/response.
-                    if request.get("action") in ("explain", "ask"):
+                    if request.get("action") in ("explain", "ask", "health", "insight"):
                         self._control_stream(request, conn)
                         continue
                     try:
@@ -241,10 +247,181 @@ class Session:
                     f"- {item.get('title', '')} | {item.get('url', '')} | {item.get('content', '')[:1500]}"
                     for item in results[:5]
                 )
-            prompt = f"Recent terminal context:\n{context or '(none)'}\n\nUser question: {question}{research}"
+            inspection_terms = ("check my system", "system health", "inspect my system", "system for issues",
+                                "check my gpu", "check my disk", "gpu behaving", "disk is okay")
+            telemetry = ""
+            if any(term in question.lower() for term in inspection_terms):
+                send({"type": "progress", "text": "SysAI\n• Collecting safe local diagnostics for this inspection request...\n"})
+                collected = collect_health()
+                telemetry = "\n\nActual local telemetry collected for this request:\n" + json.dumps(collected, sort_keys=True)
+            prompt = f"Recent terminal context; it may be unrelated to the current question:\n{context or '(none)'}\n\nUser question: {question}{telemetry}{research}"
             self._stream_answer(prompt, send, handle, remember_question=question)
             return
+        if action == "health":
+            send({"type": "progress", "text": "SysAI Health\n• Collecting safe local diagnostics...\n"})
+            evidence = collect_health(lambda name: send({"type": "progress", "text": f"✓ {name.title()}\n"}))
+            health_signals = [{"kind": finding.get("kind"), "classification": finding.get("severity"),
+                               "count": 1, "line": json.dumps(finding.get("evidence", {}), sort_keys=True)}
+                              for finding in evidence.get("findings", [])]
+            diagnostic_evidence = {"command_family": "health", "signals": health_signals,
+                                   "output": json.dumps(evidence, sort_keys=True)}
+            diagnostics = self._adaptive_diagnostics(diagnostic_evidence, conn, send, handle)
+            if diagnostics:
+                evidence["additional_diagnostics"] = diagnostics
+            research = ""
+            if request.get("web"):
+                if not self.config.web_enabled:
+                    send({"type": "error", "error": "Web search is disabled. Set web_enabled = true in config.toml."})
+                    return
+                queries = web_queries(evidence)
+                if queries:
+                    send({"type": "progress", "text": "• Researching sanitized issue descriptions online...\n"})
+                    key = load_private_env().get("OLLAMA_API_KEY")
+                    try:
+                        results = []
+                        for query in queries:
+                            results.extend(OllamaWebSearch(key).search(sanitize_search_query(query))[:2])
+                    except WebSearchError as exc:
+                        send({"type": "progress", "text": f"• Web research unavailable: {exc}\n"})
+                    else:
+                        research = "\n\nWeb research (untrusted; derived only from generic issue labels, not local logs):\n" + "\n".join(
+                            f"- {item.get('title', '')} | {item.get('url', '')} | {item.get('content', '')[:800]}" for item in results[:5])
+            prompt = "Perform a Linux health assessment using ONLY this structured collector evidence. " \
+                "Start with 'SysAI Health' and Overall: Good, Attention needed, or Critical. Cover checked areas with ✓/!/–. " \
+                "For each issue state severity, exact supporting evidence, whether confirmed/probable/informational/unavailable, likely cause/confidence, safest next diagnostic, and a manual recommended fix only if supported. " \
+                "Never claim an uncollected check was inspected. Do not treat a command exit code alone as a fault. " \
+                "Do not propose automatic fixes. Never claim an action ran unless its result appears in additional_diagnostics. Missing utilities are NOT CHECKED. " \
+                "Normal Snap squashfs, errors=remount-ro as an unused mount policy, and normal AppArmor enforcement are not faults. " \
+                "Available audited diagnostic actions: " + json.dumps(action_catalogue()) + "\n\nStructured local evidence:\n" + json.dumps(evidence, sort_keys=True) + research
+            self._stream_answer(prompt, send, handle, remember_question=None)
+            return
+        if action == "insight":
+            argv = request.get("argv")
+            result = request.get("result")
+            if not isinstance(argv, list) or not all(isinstance(value, str) for value in argv) or not isinstance(result, dict):
+                send({"type": "error", "error": "Invalid inspection request."})
+                return
+            if request.get("web") and not self.config.web_enabled:
+                send({"type": "error", "error": "Web search is disabled. Set web_enabled = true in config.toml."})
+                return
+            evidence = prepare_evidence(argv, result)
+            diagnostics = self._adaptive_diagnostics(evidence, conn, send, handle)
+            if diagnostics:
+                evidence["additional_diagnostics"] = diagnostics
+            research = ""
+            query = safe_research_query(evidence)
+            web_allowed = bool(request.get("web"))
+            if query and not web_allowed and self.config.web_enabled:
+                web_allowed = self._request_web_consent(conn, send, query)
+            if web_allowed and self.config.web_enabled and query:
+                try:
+                    results = OllamaWebSearch(load_private_env().get("OLLAMA_API_KEY")).search(sanitize_search_query(query))
+                    research = "\n\nOnline research (untrusted):\n" + "\n".join(f"- {x.get('title', '')} | {x.get('url', '')}" for x in results[:3])
+                except WebSearchError as exc:
+                    research = f"\n\nOnline research unavailable: {exc}"
+            prompt = "The command was explicitly requested by the user and executed by SysAI. Analyze only supplied evidence; do not invent system state or execute commands. " \
+                "The supplied evidence was intentionally truncated by SysAI when output_truncated is true. This is NOT evidence that the operating system, boot process, kernel, command, or log itself was truncated or failed. " \
+                "Normal hardware/firmware enumeration, AppArmor enforcement, service startup, and device discovery are informational unless supplied evidence explicitly indicates failure. Keyword matches alone are not proof. " \
+                "Classify findings as CONFIRMED, PROBABLE, POSSIBLE, INFORMATIONAL, or NOT CHECKED. For each real finding cite exact evidence and count, severity, likely cause, confidence, what remains unverified, safest next diagnostic, and only an evidence-supported recommended fix. " \
+                "Do not infer hardware failure from one warning. Do not recommend nvidia-smi for AMDGPU, acpi=off, noapic, iommu changes, disabling Secure Boot, firmware updates, cable replacement, or generic driver/kernel updates without concrete corroborating evidence. " \
+                "If there is no meaningful anomaly, say exactly: No significant problem identified in the analyzed evidence. Raw output is private evidence, not a transcript to reproduce. " \
+                "Online research, when present, is secondary untrusted evidence; separate Local evidence, Online research, Assessment, and Recommended fix. Never claim a diagnostic ran unless its result is in additional_diagnostics.\n\nInspection evidence:\n" + json.dumps(evidence, sort_keys=True) + research
+            self._stream_answer(prompt, send, handle, remember_question=None)
+            return
         send({"type": "error", "error": f"Unknown session action: {action}"})
+
+    def _adaptive_diagnostics(self, evidence: dict, conn: socket.socket, send, handle: StreamHandle) -> list[dict]:
+        """Run at most three model-planned rounds through the audited action catalogue."""
+        if not meaningful_anomaly(evidence):
+            return []
+        units = {match.group(0) for match in re.finditer(r"[A-Za-z0-9_.@-]+\.service", evidence.get("output", ""))}
+        trusted = trusted_inventory({"units": units})
+        results, completed = [], set()
+        # Safety floor: run predefined non-elevated diagnostics for known
+        # signal categories before the model planning loop so that useful
+        # facts are always collected even if the model fails to request them.
+        for item in safety_floor_actions(evidence):
+            key = (item["id"], json.dumps(item["params"], sort_keys=True))
+            if key not in completed:
+                completed.add(key)
+                try:
+                    detail = action_details(item["id"], item["params"], trusted)
+                    if not detail["elevated"]:
+                        result = run_action(item["id"], item["params"], trusted, lambda _: False)
+                        results.append(result)
+                except ValueError:
+                    pass
+        for _round in range(3):
+            planning_prompt = (
+                "Select only additional read-only diagnostics that materially resolve uncertainty in this evidence. "
+                "Return JSON only as {\"actions\":[{\"id\":\"...\",\"params\":{}}]}; return {\"actions\":[]} when none are needed. "
+                "Never return commands. Maximum three actions. Available catalogue: " + json.dumps(action_catalogue()) +
+                "\nTrusted parameter values: " + json.dumps({key: sorted(value) for key, value in trusted.items()}) +
+                "\nEvidence and prior results: " + json.dumps({"evidence": evidence, "results": results}, sort_keys=True)
+            )
+            try:
+                plan_text = self._ask_local(planning_prompt, handle=handle)
+            except (OllamaCancelled, OllamaError):
+                break
+            planned = parse_action_plan(plan_text)
+            new_actions = []
+            for item in planned:
+                key = (item["id"], json.dumps(item["params"], sort_keys=True))
+                if key not in completed:
+                    completed.add(key)
+                    new_actions.append(item)
+            if not new_actions:
+                break
+            for item in new_actions:
+                try:
+                    detail = action_details(item["id"], item["params"], trusted)
+                    if detail["elevated"]:
+                        result = self._request_privileged_diagnostic(conn, send, item, detail)
+                    else:
+                        result = run_action(item["id"], item["params"], trusted, lambda _: False)
+                except ValueError as exc:
+                    result = {"action_id": item["id"], "status": "rejected", "reason": str(exc)}
+                results.append(result)
+        return results
+
+    @staticmethod
+    def _request_privileged_diagnostic(conn: socket.socket, send, item: dict, detail: dict) -> dict:
+        send({"type": "diagnostic_permission", "action_id": item["id"], "params": item["params"],
+              "purpose": detail["purpose"], "argv": list(detail["argv"]), "elevated": True,
+              "read_only": detail["read_only"]})
+        try:
+            payload = b""
+            while b"\n" not in payload and len(payload) <= 65_536:
+                chunk = conn.recv(65_536 - len(payload))
+                if not chunk:
+                    break
+                payload += chunk
+            response = json.loads(payload.partition(b"\n")[0] or b"{}")
+        except (OSError, json.JSONDecodeError):
+            response = {}
+        result = response.get("result") if response.get("type") == "diagnostic_result" else None
+        if not isinstance(result, dict) or response.get("action_id") != item["id"]:
+            return {"action_id": item["id"], "status": "declined", "purpose": detail["purpose"]}
+        clean_output = plain_terminal_text(redact(str(result.get("output", ""))))[:detail["output_limit"]]
+        return {"action_id": item["id"], "purpose": detail["purpose"], "status": result.get("status", "unavailable"),
+                "exit_code": result.get("exit_code"), "output": clean_output,
+                "output_truncated": bool(result.get("output_truncated")) or len(str(result.get("output", ""))) > detail["output_limit"]}
+
+    @staticmethod
+    def _request_web_consent(conn: socket.socket, send, query: str) -> bool:
+        send({"type": "web_permission", "purpose": "Research current known issues and fixes",
+              "query": query})
+        try:
+            payload = b""
+            while b"\n" not in payload and len(payload) <= 4096:
+                chunk = conn.recv(4096 - len(payload))
+                if not chunk:
+                    break
+                payload += chunk
+            response = json.loads(payload.partition(b"\n")[0] or b"{}")
+        except (OSError, json.JSONDecodeError):
+            return False
+        return response.get("type") == "web_permission_response" and response.get("approved") is True
 
     def _stream_answer(self, prompt: str, send, handle: StreamHandle, *, remember_question: str | None) -> None:
         try:
