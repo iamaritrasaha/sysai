@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import stat
 import subprocess
 import tempfile
@@ -54,13 +55,18 @@ class ReleaseSecurityTests(unittest.TestCase):
         })
         provider = mock.Mock()
         provider.search.return_value = []
+        server_end, client_end = socket.socketpair()
         with mock.patch("sysai.session.OllamaWebSearch", return_value=provider), \
              mock.patch("sysai.session.load_private_env", return_value={"OLLAMA_API_KEY": "fake"}), \
              mock.patch.object(session, "_ask_local", return_value="answer"):
-            response = session._control({
-                "action": "ask", "question": "release API_KEY=fake-secret", "web": True,
-            })
-        self.assertTrue(response["ok"])
+            session._control_stream(
+                {"action": "ask", "question": "release API_KEY=fake-secret", "web": True}, server_end,
+            )
+        server_end.close()
+        client_end.settimeout(2)
+        messages = [json.loads(line) for line in client_end.recv(65536).splitlines() if line]
+        client_end.close()
+        self.assertEqual(messages[-1], {"type": "done", "ok": True})
         sent_query = provider.search.call_args.args[0]
         self.assertNotIn("RAW-TRANSCRIPT", sent_query)
         self.assertNotIn("fake-secret", sent_query)

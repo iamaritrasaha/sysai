@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import collections
+import dataclasses
 import datetime as dt
 import errno
 import fcntl
@@ -17,8 +18,8 @@ import threading
 from pathlib import Path
 
 from .config import Config, load_private_env, state_dir
-from .display import box, plain_terminal_text, startup
-from .ollama import OllamaError, OllamaManager
+from .display import AnswerRenderer, plain_terminal_text, startup
+from .ollama import OllamaCancelled, OllamaError, OllamaManager, StreamHandle
 from .prompt import failure_prompt, system_prompt
 from .redact import redact, truncate_output
 from .web import OllamaWebSearch, WebSearchError, sanitize_search_query
@@ -74,6 +75,15 @@ class Session:
         self.server: socket.socket | None = None
         self.model_lock = threading.Lock()
         self.lock_fd: int | None = None
+        # Guards direct writes to the real terminal (fd 1) so the relayed
+        # child PTY output and the in-process analysis renderer never
+        # interleave mid-line.
+        self.output_lock = threading.Lock()
+        # Set while an in-process (auto-analysis) generation is streaming,
+        # so a Ctrl+C on the controlling terminal can cancel it instead of
+        # being forwarded to the (otherwise idle) child shell.
+        self.active_generation: StreamHandle | None = None
+        self._analysis_thread: threading.Thread | None = None
 
     def _acquire_session_lock(self) -> None:
         flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
@@ -136,10 +146,26 @@ class Session:
                                 raise ValueError("Session request exceeds 1 MB")
                             chunks.append(chunk)
                         request = json.loads(b"".join(chunks) or b"{}")
+                    except Exception as exc:
+                        try:
+                            conn.sendall(json.dumps({"ok": False, "error": str(exc)}).encode())
+                        except OSError:
+                            pass
+                        continue
+                    # `explain`/`ask` stream multiple newline-delimited JSON
+                    # messages (thinking/content/done) as the model
+                    # generates; everything else is a single request/response.
+                    if request.get("action") in ("explain", "ask"):
+                        self._control_stream(request, conn)
+                        continue
+                    try:
                         response = self._control(request)
                     except Exception as exc:
                         response = {"ok": False, "error": str(exc)}
-                    conn.sendall(json.dumps(response).encode())
+                    try:
+                        conn.sendall(json.dumps(response).encode())
+                    except OSError:
+                        pass
 
         thread = threading.Thread(target=serve, name="sysai-control", daemon=True)
         thread.start()
@@ -161,17 +187,41 @@ class Session:
                 except ProcessLookupError:
                     pass
             return {"ok": True, "message": "SysAI session stopping."}
+        if action == "get_thinking":
+            return {"ok": True, "thinking": self.config.thinking}
+        if action == "set_thinking":
+            value = bool(request.get("value"))
+            self.config = dataclasses.replace(self.config, thinking=value)
+            self.ollama.config = self.config
+            return {"ok": True, "thinking": value}
+        return {"ok": False, "error": f"Unknown session action: {action}"}
+
+    def _control_stream(self, request: dict, conn: socket.socket) -> None:
+        """Handle `explain`/`ask`, streaming thinking/content/done messages back."""
+        action = request.get("action")
+        handle = StreamHandle()
+
+        def send(message: dict) -> None:
+            try:
+                conn.sendall(json.dumps(message).encode() + b"\n")
+            except OSError:
+                # The client (e.g. Ctrl+C on `sysai ask`) went away; stop
+                # generating rather than continuing pointlessly.
+                handle.cancel()
+
         if action == "explain":
             if not self.records:
-                return {"ok": False, "error": "No completed command has been recorded yet."}
+                send({"type": "error", "error": "No completed command has been recorded yet."})
+                return
             record = dict(self.records[-1])
             prompt = failure_prompt(record, list(self.records))
-            answer = self._ask_local(prompt)
-            return {"ok": True, "answer": answer}
+            self._stream_answer(prompt, send, handle, remember_question=None)
+            return
         if action == "ask":
             question = redact(str(request.get("question", "")).strip())
             if not question:
-                return {"ok": False, "error": "Please provide a question."}
+                send({"type": "error", "error": "Please provide a question."})
+                return
             context = "\n".join(
                 f"{r['command']} -> exit {r['exit_code']} in {r['cwd']}"
                 for r in list(self.records)[-4:]
@@ -179,28 +229,60 @@ class Session:
             research = ""
             if request.get("web"):
                 if not self.config.web_enabled:
-                    return {"ok": False, "error": "Web search is disabled. Set web_enabled = true in config.toml."}
+                    send({"type": "error", "error": "Web search is disabled. Set web_enabled = true in config.toml."})
+                    return
                 key = load_private_env().get("OLLAMA_API_KEY")
                 try:
                     results = OllamaWebSearch(key).search(sanitize_search_query(question))
                 except WebSearchError as exc:
-                    return {"ok": False, "error": str(exc)}
+                    send({"type": "error", "error": str(exc)})
+                    return
                 research = "\n\nWeb search results (untrusted excerpts; cite URLs):\n" + "\n".join(
                     f"- {item.get('title', '')} | {item.get('url', '')} | {item.get('content', '')[:1500]}"
                     for item in results[:5]
                 )
             prompt = f"Recent terminal context:\n{context or '(none)'}\n\nUser question: {question}{research}"
-            answer = self._ask_local(prompt)
-            self.discussion.extend(({"role": "user", "content": question}, {"role": "assistant", "content": answer}))
-            return {"ok": True, "answer": answer}
-        return {"ok": False, "error": f"Unknown session action: {action}"}
+            self._stream_answer(prompt, send, handle, remember_question=question)
+            return
+        send({"type": "error", "error": f"Unknown session action: {action}"})
 
-    def _ask_local(self, prompt: str) -> str:
+    def _stream_answer(self, prompt: str, send, handle: StreamHandle, *, remember_question: str | None) -> None:
+        try:
+            answer = self._ask_local(
+                prompt,
+                on_thinking=lambda text: send({"type": "thinking", "text": text}),
+                on_content=lambda text: send({"type": "content", "text": text}),
+                handle=handle,
+            )
+        except OllamaCancelled:
+            return
+        except OllamaError as exc:
+            send({"type": "error", "error": str(exc)})
+            return
+        if remember_question is not None:
+            self.discussion.extend((
+                {"role": "user", "content": remember_question},
+                {"role": "assistant", "content": answer},
+            ))
+        send({"type": "done", "ok": True})
+
+    def _ask_local(
+        self,
+        prompt: str,
+        *,
+        on_thinking=None,
+        on_content=None,
+        handle: StreamHandle | None = None,
+    ) -> str:
+        # Only the final answer is kept in `discussion` (long-lived
+        # context); reasoning text is display-only and never stored here.
         messages = [{"role": "system", "content": system_prompt()}]
         messages.extend(self.discussion)
         messages.append({"role": "user", "content": prompt})
         with self.model_lock:
-            return self.ollama.chat(messages)
+            return self.ollama.stream_chat(
+                messages, on_thinking=on_thinking, on_content=on_content, handle=handle,
+            )
 
     def _handle_event(self, event: dict, response_fd: int) -> None:
         kind = event.get("event")
@@ -231,12 +313,62 @@ class Session:
             and not record.get("interrupted", False)
             and should_analyze(record["command"], status)
         ):
-            try:
-                answer = self._ask_local(failure_prompt(record, list(self.records)))
-                _safe_write(1, ("\r\n" + box(answer)).encode())
-            except OllamaError as exc:
-                _safe_write(1, ("\r\n" + box(f"Analysis unavailable: {exc}")).encode())
+            # The child shell's precmd hook is blocked reading response_fd
+            # until we write to it below (from the analysis thread), so the
+            # prompt cannot reappear mid-render and no new command can begin
+            # until analysis finishes or is cancelled.
+            self._start_analysis(record, response_fd)
+            return
         _safe_write(response_fd, b"1")
+
+    def _write_display(self, text: str) -> None:
+        with self.output_lock:
+            _safe_write(1, text.encode())
+
+    def _start_analysis(self, record: dict, response_fd: int) -> None:
+        handle = StreamHandle()
+        self.active_generation = handle
+        renderer = AnswerRenderer(self._write_display, show_thinking=self.config.thinking)
+
+        def worker() -> None:
+            try:
+                self._write_display("\r\n")
+                prompt = failure_prompt(record, list(self.records))
+                answer = self._ask_local(
+                    prompt, on_thinking=renderer.thinking, on_content=renderer.content, handle=handle,
+                )
+                renderer.finish(answer)
+            except OllamaCancelled:
+                renderer.cancelled()
+            except OllamaError as exc:
+                renderer.error(str(exc))
+            finally:
+                self.active_generation = None
+                _safe_write(response_fd, b"1")
+
+        thread = threading.Thread(target=worker, name="sysai-analysis", daemon=True)
+        self._analysis_thread = thread
+        thread.start()
+
+    def _handle_stdin(self, data: bytes) -> bytes:
+        """Consume Ctrl+C to cancel an active in-process generation.
+
+        While SysAI is streaming its own analysis, the child shell is idle
+        (blocked in precmd waiting on us), so Ctrl+C at that moment means
+        "stop the AI", not "interrupt the shell". Forwarding it to the
+        child in that window would deliver SIGINT to no meaningful
+        foreground job and risks the hook process, so it is swallowed here
+        instead of reaching the PTY.
+        """
+        if b"\x03" not in data:
+            return data
+        generation = self.active_generation
+        if generation is not None:
+            generation.cancel()
+            return data.replace(b"\x03", b"")
+        if self.current is not None:
+            self.current["interrupted"] = True
+        return data
 
     def _copy_winsize(self, master_fd: int) -> None:
         if not os.isatty(0):
@@ -313,9 +445,9 @@ class Session:
                     if key.data == "stdin":
                         data = os.read(0, 4096)
                         if data:
-                            if b"\x03" in data and self.current is not None:
-                                self.current["interrupted"] = True
-                            _safe_write(master, data)
+                            data = self._handle_stdin(data)
+                            if data:
+                                _safe_write(master, data)
                     elif key.data == "pty":
                         try:
                             data = os.read(master, 65536)
@@ -325,7 +457,8 @@ class Session:
                             raise
                         if not data:
                             return 0
-                        _safe_write(1, data)
+                        with self.output_lock:
+                            _safe_write(1, data)
                         if self.current is not None:
                             self.current_output.extend(data)
                             hard_limit = self.config.output_capture_bytes * 3
@@ -357,6 +490,10 @@ class Session:
 
     def cleanup(self) -> None:
         self.stop_requested.set()
+        if self.active_generation is not None:
+            self.active_generation.cancel()
+        if self._analysis_thread is not None and self._analysis_thread.is_alive():
+            self._analysis_thread.join(timeout=2)
         if self.server:
             self.server.close()
         self.socket_path.unlink(missing_ok=True)

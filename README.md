@@ -114,6 +114,38 @@ sysai
 
 Run terminal commands normally. Successful commands do not call the model. A failed command normally triggers analysis unless its non-zero status is likely routine control flow, such as `test`, `grep -q`, `command -v`, `||`, or an interrupt status.
 
+### Live reasoning ("thinking")
+
+When the configured model exposes reasoning (Ollama's `think` field, supported by `qwen3:8b`), SysAI streams it live in a dim, subdued box before the final answer:
+
+```console
+┌─ SysAI · thinking ─────────────────────────
+│ Examining the exit status...
+│ This resembles a missing executable rather
+│ than a permissions problem...
+└─────────────────────────────────────────────
+
+┌─ SysAI ────────────────────────────────────
+│ The command failed because ...
+└─────────────────────────────────────────────
+```
+
+This applies to automatic failure analysis, `sysai explain`, and `sysai ask`. Reasoning is real model output streamed as it is generated, never simulated. It is **display-only**: it is redacted and control-character-sanitized exactly like the final answer, is never written to disk, never added to SysAI's short-lived conversation context, never sent to web search, and can never become shell input. Reasoning text is model-generated and can itself be wrong; treat it the same way you treat the final answer, as a hint to verify rather than a fact.
+
+If the model does not expose reasoning, SysAI shows only the final answer, with no fake "thinking" text and no error.
+
+Control it with:
+
+```sh
+sysai thinking on       # show live reasoning (default)
+sysai thinking off      # show only the final answer
+sysai thinking status   # report the current setting
+```
+
+`on`/`off` update `~/.config/sysai/config.toml` for future sessions and, if a SysAI session is currently running, take effect immediately. `status` reports the active session's live setting if one exists, otherwise the saved configuration.
+
+**Cancelling a generation:** press Ctrl+C while SysAI is streaming thinking or an answer to cancel that generation cleanly. It stops the local model request and returns you to the normal prompt; it never kills the monitored Zsh session, corrupts the terminal, or stops Ollama.
+
 ### Explain the last command
 
 ```sh
@@ -187,26 +219,26 @@ auto_analyze_failures = true
 output_capture_bytes = 48000
 context_commands = 8
 verbosity = "concise"
-thinking = false
+thinking = true
 web_enabled = false
 web_provider = "ollama"
 request_timeout_seconds = 120
 startup_timeout_seconds = 20
 ```
 
-Edit `~/.config/sysai/config.toml` and restart SysAI. The model and API URL are configurable; no GPU name, username, or home path is embedded in the program.
+Edit `~/.config/sysai/config.toml` and restart SysAI, or use `sysai thinking on|off` to toggle `thinking` without hand-editing the file. `thinking` controls both requesting reasoning tokens from Ollama and displaying the live "SysAI · thinking" box; there is no separate display-only flag, since requesting reasoning SysAI would then throw away is wasted latency. The model and API URL are configurable; no GPU name, username, or home path is embedded in the program.
 
 ## Privacy and security model
 
-- Model output is display-only and control characters are removed before display. It is never parsed as a command or passed to a shell.
+- Model output — including reasoning ("thinking") text — is display-only and control characters are removed before display. It is never parsed as a command, never passed to a shell, and can never become terminal input.
 - Fixed executable argv is used to start Zsh and Ollama; observed command text is data, never interpolated for execution.
-- Command text and output are redacted before local model context where practical.
-- Recent command/output context exists only in bounded process memory and is not persisted by default.
-- Runtime sockets and ownership state live in a mode-`0700`, user-owned runtime directory; state is mode `0600` and written atomically.
+- Command text, output, and model reasoning are redacted before display or use as context, where practical.
+- Recent command/output context and reasoning text exist only in bounded process memory. Reasoning is never persisted to disk and is never added to SysAI's short-lived conversation context; only final answers are kept there, and only for explicit `sysai ask` follow-ups.
+- Runtime sockets and ownership state live in a mode-`0700`, user-owned runtime directory; state is mode `0600` and written atomically. `~/.config/sysai/config.toml` is written mode `0600`.
 - PTY output and hook events travel over separate file descriptors, preventing ordinary terminal output from becoming internal protocol data.
-- Web search is disabled by default and never receives a raw terminal transcript.
+- Web search is disabled by default and never receives a raw terminal transcript or model reasoning text — only an explicit, sanitized user question.
 - Secret redaction is defense in depth, not a guarantee. Avoid printing secrets and revoke any credential that may have appeared in a terminal.
-- Qwen can be mistaken. Review every suggested command, especially commands involving `sudo`, deletion, permissions, disks, packages, services, boot, `/etc`, or networking.
+- Qwen can be mistaken, in its reasoning as well as its final answer. Review every suggested command, especially commands involving `sudo`, deletion, permissions, disks, packages, services, boot, `/etc`, or networking.
 
 See [`SECURITY.md`](SECURITY.md) for vulnerability reporting.
 

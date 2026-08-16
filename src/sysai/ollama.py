@@ -4,17 +4,62 @@ import json
 import os
 import signal
 import subprocess
+import threading
 import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 from .config import Config
 
 
 class OllamaError(RuntimeError):
     pass
+
+
+class OllamaCancelled(OllamaError):
+    """Raised when a caller cancels an in-flight streaming generation."""
+
+
+class StreamHandle:
+    """Cooperative cancellation token for one streaming request.
+
+    ``cancel()`` may be called from a different thread than the one running
+    ``OllamaManager.stream_chat``. It marks the stream cancelled and, on a
+    best-effort basis, closes the in-flight HTTP response so a blocked read
+    unblocks promptly instead of waiting for the next chunk.
+    """
+
+    def __init__(self) -> None:
+        self._cancel_event = threading.Event()
+        self._response = None
+        self._lock = threading.Lock()
+
+    def attach(self, response) -> None:
+        with self._lock:
+            self._response = response
+            already_cancelled = self._cancel_event.is_set()
+        if already_cancelled:
+            self._close(response)
+
+    def cancel(self) -> None:
+        self._cancel_event.set()
+        with self._lock:
+            response = self._response
+        if response is not None:
+            self._close(response)
+
+    def is_cancelled(self) -> bool:
+        return self._cancel_event.is_set()
+
+    @staticmethod
+    def _close(response) -> None:
+        try:
+            response.close()
+        except OSError:
+            pass
 
 
 def _request(url: str, method: str = "GET", body: dict | None = None, timeout: float = 3) -> dict:
@@ -79,23 +124,85 @@ class OllamaManager:
         detail = f" See {self.log_path}." if self.log_path else ""
         raise OllamaError(f"Ollama did not become ready within {self.config.startup_timeout_seconds}s.{detail}")
 
-    def chat(self, messages: list[dict[str, str]]) -> str:
+    def stream_chat(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        on_thinking: Callable[[str], None] | None = None,
+        on_content: Callable[[str], None] | None = None,
+        handle: StreamHandle | None = None,
+    ) -> str:
+        """Stream a chat completion, invoking callbacks as chunks arrive.
+
+        Uses Ollama's native streaming NDJSON protocol (``stream: true``).
+        When the configured model supports it and ``think`` is enabled,
+        reasoning arrives incrementally in ``message.thinking`` ahead of
+        ``message.content``; models without reasoning support simply never
+        populate ``thinking``, so ``on_thinking`` is never called and this
+        degrades to a normal streamed answer.
+        """
+        if handle is not None and handle.is_cancelled():
+            raise OllamaCancelled("Generation cancelled.")
         body = {
             "model": self.config.model,
             "messages": messages,
-            "stream": False,
+            "stream": True,
             "think": self.config.thinking,
             "keep_alive": "5m",
             "options": {"temperature": 0.2},
         }
+        request = urllib.request.Request(
+            f"{self.config.ollama_url}/api/chat", data=json.dumps(body).encode(),
+            method="POST", headers={"Content-Type": "application/json"},
+        )
         try:
-            response = _request(
-                f"{self.config.ollama_url}/api/chat", "POST", body,
-                timeout=self.config.request_timeout_seconds,
-            )
-            return response["message"]["content"].strip()
-        except (OSError, urllib.error.URLError, KeyError, json.JSONDecodeError) as exc:
+            response = urllib.request.urlopen(request, timeout=self.config.request_timeout_seconds)
+        except (OSError, urllib.error.URLError) as exc:
             raise OllamaError(f"Local Qwen request failed: {exc}") from exc
+        if handle is not None:
+            handle.attach(response)
+        content_parts: list[str] = []
+        saw_done = False
+        try:
+            with response:
+                for raw_line in response:
+                    if handle is not None and handle.is_cancelled():
+                        raise OllamaCancelled("Generation cancelled.")
+                    line = raw_line.strip()
+                    if not line:
+                        continue
+                    try:
+                        chunk = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if "error" in chunk:
+                        raise OllamaError(f"Local Qwen request failed: {chunk['error']}")
+                    message = chunk.get("message") or {}
+                    thinking_piece = message.get("thinking")
+                    if thinking_piece and on_thinking is not None:
+                        on_thinking(thinking_piece)
+                    content_piece = message.get("content")
+                    if content_piece:
+                        content_parts.append(content_piece)
+                        if on_content is not None:
+                            on_content(content_piece)
+                    if chunk.get("done"):
+                        saw_done = True
+                        break
+        except (OSError, urllib.error.URLError) as exc:
+            if handle is not None and handle.is_cancelled():
+                raise OllamaCancelled("Generation cancelled.") from exc
+            raise OllamaError(f"Local Qwen request failed: {exc}") from exc
+        # Cancelling closes the response to unblock a pending read, which
+        # can also make the iterator end quietly (no exception) rather than
+        # raise mid-loop. Re-check here so a cancellation never gets
+        # reported as a normal (or merely truncated) response.
+        if handle is not None and handle.is_cancelled():
+            raise OllamaCancelled("Generation cancelled.")
+        content = "".join(content_parts).strip()
+        if not saw_done and not content:
+            raise OllamaError("Ollama stream ended unexpectedly without a response.")
+        return content
 
     def unload(self) -> None:
         if not self.available():

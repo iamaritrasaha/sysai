@@ -84,6 +84,9 @@ class CoreTests(unittest.TestCase):
         with mock.patch.object(session, "_ask_local", side_effect=OllamaError("offline")), \
              mock.patch("sysai.session._safe_write") as write:
             session._handle_event({"event": "complete", "status": 127, "cwd": "/tmp"}, 98)
+            # Analysis runs on a background thread so the relay loop stays
+            # responsive; wait for it before asserting on its side effects.
+            session._analysis_thread.join(timeout=5)
         self.assertEqual(session.records[-1]["exit_code"], 127)
         self.assertTrue(any(call.args == (98, b"1") for call in write.call_args_list))
 

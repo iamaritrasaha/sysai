@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import stat
 import tomllib
 from dataclasses import dataclass
@@ -15,7 +16,10 @@ class Config:
     output_capture_bytes: int = 48_000
     context_commands: int = 8
     verbosity: str = "concise"
-    thinking: bool = False
+    # Controls both requesting reasoning tokens from Ollama (`think`) and
+    # whether a live "SysAI · thinking" box is displayed for them. See
+    # `sysai thinking on|off|status`.
+    thinking: bool = True
     web_enabled: bool = False
     web_provider: str = "ollama"
     request_timeout_seconds: int = 120
@@ -52,6 +56,33 @@ def load_config(path: Path | None = None) -> Config:
     allowed = Config.__dataclass_fields__.keys()
     values = {key: value for key, value in raw.items() if key in allowed}
     return Config(**values)
+
+
+def _format_toml_value(value: bool | int | float | str) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    escaped = str(value).replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def set_config_value(key: str, value: bool | int | float | str, path: Path | None = None) -> Path:
+    """Persist a single scalar key into the user's config.toml, preserving the rest of the file."""
+    path = path or config_dir() / "config.toml"
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+    pattern = re.compile(rf"^\s*{re.escape(key)}\s*=")
+    formatted = f"{key} = {_format_toml_value(value)}"
+    for index, line in enumerate(lines):
+        if pattern.match(line):
+            lines[index] = formatted
+            break
+    else:
+        lines.append(formatted)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    path.chmod(0o600)
+    return path
 
 
 def load_private_env(path: Path | None = None) -> dict[str, str]:
