@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import json
 import os
 import socket
@@ -12,14 +13,22 @@ from pathlib import Path
 from unittest import mock
 
 import sysai
+from sysai import baseline, monitor, reports
 from sysai.config import Config, state_dir
+from sysai.diagnostics import action_catalogue, action_details, parse_action_plan
 from sysai.display import box
+from sysai.evidence import build
+from sysai.health import web_queries
 from sysai.ollama import is_owned_ollama_process
+from sysai.privacy import LOCAL
 from sysai.session import Session
 from sysai.web import sanitize_search_query
 
 
 ROOT = Path(__file__).resolve().parents[1]
+# Interpreters that would turn a string into executable code. SysAI never
+# builds an argv starting with one of these plus `-c`.
+SHELL_INTERPRETERS = ("bash", "sh", "dash", "ksh", "/bin/bash", "/bin/sh")
 
 
 class ReleaseSecurityTests(unittest.TestCase):
@@ -132,6 +141,99 @@ class ReleaseSecurityTests(unittest.TestCase):
         self.assertNotIn("os.system(", source)
         self.assertNotIn("eval(", source)
         self.assertNotIn("exec(", source)
+
+    def test_no_module_ever_runs_bash_dash_c_or_a_shell_interpreter(self):
+        for path in sorted((ROOT / "src/sysai").glob("*.py")):
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if not isinstance(node, (ast.Tuple, ast.List)):
+                    continue
+                literals = [element.value for element in node.elts
+                            if isinstance(element, ast.Constant) and isinstance(element.value, str)]
+                if len(literals) < 2:
+                    continue
+                with self.subTest(path=path.name, argv=literals[:2]):
+                    self.assertFalse(literals[0] in SHELL_INTERPRETERS
+                                     and literals[1] in ("-c", "-lc"),
+                                     f"{path.name} builds a shell -c argv")
+
+    def test_every_audited_action_is_read_only_and_never_a_shell(self):
+        trusted = {"units": {"x.service"}, "devices": {"/dev/sda"},
+                   "interfaces": {"eth0"}, "packages": {"bash"}}
+        parameters = {"unit": "x.service", "device": "/dev/sda",
+                      "interface": "eth0", "package": "bash"}
+        for entry in action_catalogue():
+            with self.subTest(action=entry["id"]):
+                params = {name: parameters[name] for name in entry["params"]}
+                detail = action_details(entry["id"], params, trusted)
+                self.assertTrue(detail["read_only"])
+                argv = detail["argv"]
+                self.assertNotIn(argv[0], (*SHELL_INTERPRETERS, "eval"))
+                self.assertNotIn("-c", argv[:2])
+                if argv[0] == "sudo":
+                    self.assertTrue(detail["elevated"])
+                else:
+                    self.assertFalse(detail["elevated"])
+
+    def test_a_model_cannot_supply_argv_for_any_action(self):
+        for payload in ('{"actions":[{"id":"system.kernel_version","params":{"argv":["rm","-rf","/"]}}]}',
+                        '{"actions":[{"id":"bash -c \'rm -rf /\'","params":{}}]}',
+                        '{"actions":[{"id":"disk.smart_health","params":{"device":"/dev/sda; rm -rf /"}}]}'):
+            planned = parse_action_plan(payload)
+            for item in planned:
+                with self.subTest(payload=payload):
+                    with self.assertRaises(ValueError):
+                        action_details(item["id"], item["params"],
+                                       {"units": set(), "devices": set(),
+                                        "interfaces": set(), "packages": set()})
+
+    def test_reports_and_baselines_are_sanitized_more_strictly_than_the_screen(self):
+        document = build(command="gpu", scope="gpu", level=LOCAL,
+                         sections={"note": "host 192.168.1.42 mac a4:bb:6d:1f:2e:3c"})
+        self.assertEqual(document["privacy"]["level"], LOCAL)
+        markdown = reports.to_markdown(document)
+        self.assertNotIn("192.168.1.42", markdown)
+        self.assertNotIn("a4:bb:6d:1f:2e:3c", markdown)
+        self.assertEqual(baseline.snapshot()["schema_version"], baseline.SCHEMA_VERSION)
+
+    def test_web_queries_are_built_from_finding_labels_not_evidence(self):
+        document = build(
+            command="gpu", scope="gpu",
+            sections={"gpu": {"driver": {"drivers_in_use": ["amdgpu"]}}},
+            findings=[{"id": "gpu.kernel_events", "domain": "gpu",
+                       "evidence": {"sample": ["SECRET /home/alice 10.0.0.1 token=abc"]},
+                       "title": "SECRET /home/alice"}])
+        joined = " ".join(web_queries(document))
+        for secret in ("SECRET", "alice", "10.0.0.1", "token"):
+            self.assertNotIn(secret, joined)
+        self.assertIn("amdgpu", joined)
+
+    def test_watch_never_persists_telemetry(self):
+        result = {"domain": "memory", "requested_duration": 5, "interval": 1,
+                  "samples": [{"at": 1.0, "used_percent": 10.0}], "sample_count": 1,
+                  "interrupted": False, "started_wall": 0.0, "ended_wall": 5.0}
+        document = monitor.build_evidence(result, monitor.summarize(result),
+                                          {"available": True, "count": 0, "sample": []})
+        self.assertNotIn("samples", document["sections"].get("metrics", {}))
+        self.assertFalse(document["sections"]["raw_samples_retained"])
+
+    def test_only_documented_paths_are_ever_written(self):
+        """Persistent writes belong to config, baselines, and explicit reports."""
+        writers = {"config.py": {"set_config_value"}, "baseline.py": {"create"},
+                   "reports.py": {"write"}, "session.py": {"_write_state", "write_session_rcfile"},
+                   "ollama.py": {"ensure_ready"}, "updater.py": {"_extract"}}
+        for path in sorted((ROOT / "src/sysai").glob("*.py")):
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                        and node.func.attr in ("write_text", "write_bytes")):
+                    continue
+                enclosing = [item.name for item in ast.walk(tree)
+                             if isinstance(item, ast.FunctionDef)
+                             and item.lineno <= node.lineno <= (item.end_lineno or item.lineno)]
+                with self.subTest(path=path.name, line=node.lineno):
+                    self.assertTrue(set(enclosing) & writers.get(path.name, set()),
+                                    f"{path.name}:{node.lineno} writes outside a documented writer")
 
     def test_installer_refuses_symlinked_launcher(self):
         with tempfile.TemporaryDirectory() as temp:

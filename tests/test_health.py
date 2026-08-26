@@ -8,10 +8,12 @@ from unittest import mock
 
 import socket
 
+from sysai import collect
 from sysai.cli import main
 from sysai.display import ANSI_RE, AnswerRenderer
-from sysai.health import (_command, _findings, _uptime, action_catalogue, action_details,
-                          collect_health, parse_action_plan, prompt_permission, run_action,
+from sysai.domains import analyze_disk, analyze_thermal
+from sysai.health import (_command, action_catalogue, action_details, collect_health,
+                          parse_action_plan, prompt_permission, run_action,
                           safety_floor_actions, web_queries)
 from sysai.session import Session
 from sysai.config import Config
@@ -24,14 +26,19 @@ class HealthTests(unittest.TestCase):
         request.assert_called_once_with("health", web=True)
 
     def test_collector_is_structured_with_missing_tools(self):
-        with mock.patch("sysai.health.shutil.which", return_value=None):
+        with mock.patch("sysai.collect.shutil.which", return_value=None):
             result = collect_health()
-        self.assertIn("checks", result)
-        self.assertEqual(result["checks"]["services"]["status"], "unavailable")
+        self.assertIn("sections", result)
+        self.assertIn("services", result["sections"])
+        # A missing utility is NOT CHECKED, never an invented failure.
+        reasons = {item["reason"] for item in result["unavailable"]}
+        self.assertTrue(any("not installed" in reason for reason in reasons))
+        self.assertTrue(all(item["classification"] == "NOT CHECKED"
+                            for item in result["unavailable"]))
 
     def test_command_timeout_and_no_shell(self):
-        with mock.patch("sysai.health.shutil.which", return_value="/bin/true"), \
-             mock.patch("sysai.health.subprocess.run", side_effect=__import__("subprocess").TimeoutExpired(["x"], 1)) as run:
+        with mock.patch("sysai.collect.shutil.which", return_value="/bin/true"), \
+             mock.patch("sysai.collect.subprocess.run", side_effect=__import__("subprocess").TimeoutExpired(["x"], 1)) as run:
             result = _command(("x", "--fixed"))
         self.assertEqual(result["reason"], "timed out")
         self.assertNotIn("shell", run.call_args.kwargs)
@@ -44,20 +51,29 @@ class HealthTests(unittest.TestCase):
         self.assertNotIn("alice", " ".join(queries))
         self.assertNotIn("10.0.0.1", " ".join(queries))
 
-    def test_normal_mount_options_and_snap_do_not_become_findings(self):
-        checks = {"storage": {"filesystems": [
-            {"mountpoint": "/", "currently_read_only": False, "mount_options": ["rw", "errors=remount-ro"], "capacity_percent": 30},
-            {"mountpoint": "/snap/x", "fstype": "squashfs", "currently_read_only": True, "capacity_percent": 100},
-        ]}, "services": {}, "reboot": {}}
-        self.assertEqual(_findings(checks), [])
+    def test_normal_mount_options_do_not_become_findings(self):
+        sections = {"filesystems": [
+            {"mountpoint": "/", "fstype": "ext4", "currently_read_only": False,
+             "mount_options": ["rw", "errors=remount-ro"], "capacity_percent": 30,
+             "inode_percent": 12},
+        ], "errors": {}, "smart": {"tool_available": False}}
+        self.assertEqual(analyze_disk(sections), [])
+
+    def test_snap_squashfs_mounts_are_never_collected(self):
+        proc_mounts = ("/dev/loop0 /snap/core/1 squashfs ro,nodev 0 0\n"
+                       "/dev/sda1 / ext4 rw,relatime 0 0\n")
+        with mock.patch("sysai.collect.read_text", return_value=proc_mounts):
+            points = [row["mountpoint"] for row in collect.mounts()]
+        self.assertNotIn("/snap/core/1", points)
 
     def test_uptime_only_uses_first_proc_field(self):
-        with mock.patch("sysai.health._read", return_value="100.0 99999.0"):
-            self.assertEqual(_uptime(), {"status": "ok", "seconds": 100.0})
+        with mock.patch("sysai.collect.read_text", return_value="100.0 99999.0"):
+            self.assertEqual(collect.uptime_seconds(), 100.0)
 
-    def test_unknown_sensor_is_not_cpu(self):
-        with mock.patch("sysai.health.Path.glob", return_value=[]):
-            self.assertEqual(collect_health()["checks"]["temperature"]["sensors"], [])
+    def test_absent_thermal_sensors_are_not_a_failure(self):
+        with mock.patch("sysai.collect.Path.glob", return_value=[]):
+            self.assertEqual(collect.thermal_zones(), [])
+        self.assertEqual(analyze_thermal({"summary": {"max_celsius": None}, "throttling": {}}), [])
 
     def test_action_catalogue_rejects_unknown_and_untrusted_parameters(self):
         with self.assertRaisesRegex(ValueError, "unknown"):
@@ -67,11 +83,11 @@ class HealthTests(unittest.TestCase):
 
     def test_privileged_action_needs_per_action_approval(self):
         trusted = {"devices": {"/dev/sdb"}}
-        with mock.patch("sysai.health._command") as command:
+        with mock.patch("sysai.diagnostics.run") as command:
             declined = run_action("disk.smart_health", {"device": "/dev/sdb"}, trusted, lambda _: False)
         self.assertEqual(declined["status"], "declined")
         command.assert_not_called()
-        with mock.patch("sysai.health._command", return_value={"status": "ok"}) as command:
+        with mock.patch("sysai.diagnostics.run", return_value={"status": "ok"}) as command:
             run_action("disk.smart_health", {"device": "/dev/sdb"}, trusted, lambda _: True)
         self.assertEqual(command.call_args.args[0][0], "sudo")
 
@@ -95,7 +111,7 @@ class HealthTests(unittest.TestCase):
     def test_approval_is_once_only_and_rejection_never_executes(self):
         trusted = {"devices": {"/dev/sdb"}}
         approvals = []
-        with mock.patch("sysai.health._command") as command:
+        with mock.patch("sysai.diagnostics.run") as command:
             result = run_action("disk.smart_health", {"device": "/dev/sdb"}, trusted,
                                 lambda detail: approvals.append(detail["id"]) or False)
         self.assertEqual(result["status"], "declined")
@@ -110,7 +126,7 @@ class HealthTests(unittest.TestCase):
             '{"actions":[]}',
         ))
         with mock.patch.object(session, "_ask_local", side_effect=lambda *args, **kwargs: next(plans)), \
-             mock.patch("sysai.health._command", return_value={"status": "ok", "output": "6.8.0"}) as command:
+             mock.patch("sysai.diagnostics.run", return_value={"status": "ok", "output": "6.8.0"}) as command:
             results = session._adaptive_diagnostics(evidence, mock.Mock(), mock.Mock(), mock.Mock())
         self.assertEqual(results[0]["action_id"], "system.kernel_version")
         self.assertEqual(command.call_args.args[0], ("uname", "-r"))
@@ -118,7 +134,7 @@ class HealthTests(unittest.TestCase):
         session = Session(Config(), "/bin/true")
         plans = iter(('{"actions":[{"id":"model.shell","params":{"argv":["rm","-rf","/"]}}]}', '{"actions":[]}'))
         with mock.patch.object(session, "_ask_local", side_effect=lambda *args, **kwargs: next(plans)), \
-             mock.patch("sysai.health._command") as command:
+             mock.patch("sysai.diagnostics.run") as command:
             results = session._adaptive_diagnostics(evidence, mock.Mock(), mock.Mock(), mock.Mock())
         self.assertEqual(results[0]["status"], "rejected")
         command.assert_not_called()
@@ -264,7 +280,7 @@ class HealthTests(unittest.TestCase):
         }
         # Model always returns empty plan so only the safety floor produces results.
         with mock.patch.object(session, "_ask_local", return_value='{"actions":[]}'), \
-             mock.patch("sysai.health._command", return_value={"status": "ok", "output": "6.8.0"}) as command:
+             mock.patch("sysai.diagnostics.run", return_value={"status": "ok", "output": "6.8.0"}) as command:
             results = session._adaptive_diagnostics(gpu_evidence, mock.Mock(), mock.Mock(), mock.Mock())
         action_ids = [r.get("action_id") for r in results]
         self.assertIn("gpu.pci_driver", action_ids)
@@ -290,7 +306,7 @@ class HealthTests(unittest.TestCase):
 
         server_end, client_end = socket.socketpair()
         with mock.patch.object(session, "_ask_local", side_effect=fake_ask), \
-             mock.patch("sysai.health._command", return_value={"status": "ok", "output": "test"}):
+             mock.patch("sysai.diagnostics.run", return_value={"status": "ok", "output": "test"}):
             session._control_stream(
                 {"action": "insight", "argv": ["dmesg"], "web": False,
                  "result": {"exit_code": 0, "output": gpu_dmesg_output, "truncated": False}},
@@ -321,7 +337,7 @@ class HealthTests(unittest.TestCase):
             "output": "apparmor DENIED",
         }
         command_calls = []
-        with mock.patch("sysai.health._command", side_effect=lambda *a, **kw: command_calls.append(a)):
+        with mock.patch("sysai.diagnostics.run", side_effect=lambda *a, **kw: command_calls.append(a)):
             result = session._adaptive_diagnostics(evidence_no_anomaly, mock.Mock(), mock.Mock(), mock.Mock())
         # informational-only → no diagnostics (safety floor doesn't fire)
         self.assertEqual(result, [])

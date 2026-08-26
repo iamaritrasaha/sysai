@@ -7,12 +7,18 @@ import signal
 import socket
 import sys
 
-from . import __version__
+from . import __version__, baseline, changes, monitor, reports, updater, whatis
+from .collect import run as _command
 from .config import load_config, set_config_value, state_dir
+from .diagnostics import action_details, prompt_permission
 from .display import AnswerRenderer
-from .health import _command, action_details, prompt_permission
+from .doctor import doctor_command
+from .domains import DOMAINS, FULL_SYSTEM
+from .health import collect_scope
 from .insight import classify, execute, permission_failure, permission_purpose
+from .intent import keyword_route
 from .ollama import OllamaError, is_owned_ollama_process
+from .render import render_document
 from .session import Session
 
 
@@ -269,6 +275,282 @@ def insight_command(argv: list[str], *, raw: bool = False, web: bool = False) ->
     return _stream_session_request("insight", argv=argv, result=result, web=web)
 
 
+NO_SESSION_NOTE = (
+    "SysAI: the local model assessment needs an active SysAI session.\n"
+    "       Start one with `sysai`, then run this command again.\n"
+    "       The deterministic diagnostics above were collected without it."
+)
+
+
+def _write(text: str) -> None:
+    sys.stdout.write(text)
+    sys.stdout.flush()
+
+
+def _assess_or_note(scope: str, document: dict, web: bool, *, adaptive: bool = True) -> int:
+    """Hand deterministic evidence to the session for explanation, if one is running."""
+    if not _active_socket():
+        print(NO_SESSION_NOTE, file=sys.stderr)
+        return 0
+    return _stream_session_request("assess", scope=scope, evidence=document,
+                                   web=web, adaptive=adaptive)
+
+
+def domain_command(scope: str, *, web: bool = False, command: str | None = None) -> int:
+    """Collect one domain deterministically, render it, then explain it."""
+    document = collect_scope(scope, web=web, command=command or scope)
+    _write(render_document(document))
+    _write("\n")
+    return _assess_or_note(scope, document, web)
+
+
+def check_command(question: str, *, web: bool = False) -> int:
+    question = " ".join(str(question).split())
+    if not question:
+        print("SysAI: Please describe what you want checked.", file=sys.stderr)
+        return 2
+    scope, matched = keyword_route(question)
+    method = "keywords"
+    if scope is None:
+        # Only a genuinely ambiguous question reaches the model, and its reply
+        # must be one name from the strict enum or it is discarded.
+        response = _session_request("classify", question=question)
+        scope = response.get("scope") if response.get("ok") else None
+        method = "model" if scope else "fallback"
+        if scope not in (*DOMAINS, FULL_SYSTEM):
+            scope = FULL_SYSTEM
+    _write(f"SysAI Check\n• Question: {question}\n"
+           f"• Routed to: {scope} ({method}"
+           + (f": {', '.join(matched[:4])}" if matched else "") + ")\n\n")
+    document = collect_scope(scope, web=web, command="check")
+    document["request"]["arguments"] = {"question": question, "routing": method}
+    _write(render_document(document))
+    _write("\n")
+    return _assess_or_note(scope, document, web)
+
+
+def investigate_command(*, web: bool = False) -> int:
+    if not _active_socket():
+        print("SysAI: No active SysAI session was found.", file=sys.stderr)
+        return 1
+    return _stream_session_request("investigate", web=web)
+
+
+def what_command(parts: list[str]) -> int:
+    """Explain a command. Nothing here executes it."""
+    text = parts[0] if len(parts) == 1 else " ".join(parts)
+    result = whatis.explain(text)
+    _write(whatis.render(result))
+    return 0 if not result.get("parse_error") else 2
+
+
+def report_command(scope: str, *, last: bool = False, as_json: bool = False,
+                   output: str | None = None) -> int:
+    if last:
+        response = _session_request("last_result")
+        if not response.get("ok"):
+            print(f"SysAI: {response.get('error', 'No previous diagnostic result is available.')}",
+                  file=sys.stderr)
+            return 1
+        document = response["result"]
+    else:
+        target = FULL_SYSTEM if scope in ("health", "full", "system", FULL_SYSTEM) else scope
+        document = collect_scope(target, command="report")
+    text = reports.to_json(document) if as_json else reports.to_markdown(document)
+    if not output:
+        _write(text)
+        return 0
+    path = reports.write(output, text)
+    print(f"SysAI: report written to {path} (mode 0600).")
+    return 0
+
+
+def baseline_command(action: str) -> int:
+    try:
+        if action == "create":
+            path, document = baseline.create()
+            print(f"SysAI: baseline written to {path} (mode 0600).")
+            print(f"       Created {document['created']}; deterministic sanitized facts only.")
+            return 0
+        if action == "show":
+            _write(baseline.render_snapshot(baseline.load()))
+            return 0
+        if action == "delete":
+            removed = baseline.delete()
+            print("SysAI: baseline deleted." if removed else "SysAI: no baseline exists.")
+            return 0
+        result = baseline.compare(baseline.load())
+        _write(baseline.render_comparison(result))
+    except baseline.BaselineError as exc:
+        print(f"SysAI: {exc}", file=sys.stderr)
+        return 1
+    if not result["change_count"] or not _active_socket():
+        return 0
+    _write("\n")
+    document = {"schema_version": 1, "request": {"command": "baseline compare", "scope": "system"},
+                "system": result["current"].get("system", {}),
+                "sections": {"baseline_comparison": {
+                    "changed": result["changed"], "added": result["added"],
+                    "removed": result["removed"], "baseline_created": result["baseline_created"]}},
+                "findings": [], "diagnostics": [], "unavailable": [],
+                "timestamp": result["compared_at"]}
+    return _stream_session_request("assess", scope="system", evidence=document,
+                                   web=False, adaptive=False)
+
+
+def changes_command(since: str | None, *, web: bool = False) -> int:
+    try:
+        document = changes.collect_changes(since, web=web)
+    except changes.ChangesError as exc:
+        print(f"SysAI: {exc}", file=sys.stderr)
+        return 2
+    _write(changes.render_changes(document))
+    _write("\n")
+    return _assess_or_note("changes", document, web)
+
+
+def watch_command(domain: str, duration: int, interval: int, *, web: bool = False) -> int:
+    try:
+        monitor.validate(duration, interval)
+    except monitor.WatchError as exc:
+        print(f"SysAI: {exc}", file=sys.stderr)
+        return 2
+    _write(f"SysAI Watch · {domain}\n"
+           f"• Sampling every {interval}s for up to {duration}s. Press Ctrl+C to stop early.\n\n")
+
+    interactive = sys.stdout.isatty()
+
+    def progress(index: int, _sample: dict) -> None:
+        if interactive:
+            _write(f"\r  sample {index}   ")
+
+    try:
+        result = monitor.run_watch(domain, duration, interval, on_sample=progress)
+    except monitor.WatchError as exc:
+        print(f"SysAI: {exc}", file=sys.stderr)
+        return 2
+    if interactive:
+        _write("\r" + " " * 24 + "\r")
+    summary = monitor.summarize(result)
+    kernel = monitor.kernel_events_during(result)
+    _write(monitor.render_summary(result, summary, kernel))
+    _write("\n")
+    document = monitor.build_evidence(result, summary, kernel, web=web)
+    # One model call, after sampling; never per sample, and no research during it.
+    return _assess_or_note("watch", document, web, adaptive=False)
+
+
+def update_command(action: str) -> int:
+    try:
+        status = updater.check()
+    except updater.UpdateError as exc:
+        print(f"SysAI: {exc}", file=sys.stderr)
+        return 1
+    if action == "check":
+        _write(updater.render_check(status))
+        return 0
+    if not status["update_available"]:
+        print(f"SysAI is up to date ({status['current_version']}).")
+        return 0
+    state = updater.installation_state()
+    if state["kind"] == "checkout":
+        print(f"SysAI: {status['latest_version']} is available, but this SysAI runs from a "
+              f"{state['detail']} at {state['path']}.")
+        print("SysAI does not update a repository checkout, and never pulls from a branch.")
+        print(updater.manual_instructions(status))
+        return 1
+    if not status["verifiable"]:
+        print(f"SysAI: A newer release exists ({status['latest_version']}), but automatic update "
+              "is unavailable because no verifiable release artifact/checksum is published.")
+        print(updater.manual_instructions(status))
+        return 1
+    try:
+        result = updater.apply()
+    except updater.UpdateError as exc:
+        print(f"SysAI: {exc}", file=sys.stderr)
+        return 1
+    if result.get("applied"):
+        print(f"SysAI updated to {result['latest_version']} from a checksum-verified release.")
+        return 0
+    print(f"SysAI: automatic update was not applied ({result.get('reason', 'unknown')}).")
+    print(updater.manual_instructions(status))
+    return 1
+
+
+# Every word argparse owns. A reserved word is never re-interpreted as a raw
+# Command Insight command, so `sysai disk` is the disk diagnostic and not an
+# attempt to run a program called `disk`.
+RESERVED = {
+    "explain", "investigate", "ask", "check", "health", "doctor", "what", "report",
+    "baseline", "changes", "watch", "update", "thinking", "stop",
+    *DOMAINS, "--help", "-h", "--version",
+}
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="sysai", description="Local AI-aware Bash session")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    sub = parser.add_subparsers(dest="command")
+
+    sub.add_parser("explain", help="analyze the most recently completed command")
+    investigate = sub.add_parser("investigate", help="gather more safe evidence about the last failure")
+    investigate.add_argument("--web", action="store_true", help="research sanitized findings online")
+
+    ask = sub.add_parser("ask", help="ask a local Ubuntu/Linux question")
+    ask.add_argument("--web", action="store_true", help="research this sanitized question online")
+    ask.add_argument("question", nargs="+")
+
+    check = sub.add_parser("check", help="answer a plain-language question about this machine")
+    check.add_argument("--web", action="store_true", help="research sanitized findings online")
+    check.add_argument("question", nargs="+")
+
+    health = sub.add_parser("health", help="summarize every diagnostic domain")
+    health.add_argument("--web", action="store_true", help="research sanitized detected issues online")
+
+    doctor = sub.add_parser("doctor", help="diagnose SysAI's own installation")
+    doctor.add_argument("--json", action="store_true", dest="as_json", help="machine-readable output")
+
+    for domain in DOMAINS:
+        domain_parser = sub.add_parser(domain, help=f"diagnose {domain}")
+        domain_parser.add_argument("--web", action="store_true",
+                                   help="research sanitized detected issues online")
+
+    what = sub.add_parser("what", help="explain a command without running it")
+    what.add_argument("target", nargs="+", metavar="COMMAND")
+
+    report = sub.add_parser("report", help="produce a sanitized diagnostic report")
+    report.add_argument("scope", nargs="?", default="health",
+                        choices=["health", "full_system", *DOMAINS])
+    report.add_argument("--last", action="store_true",
+                        help="report the last completed diagnostic from this session")
+    report.add_argument("--json", action="store_true", dest="as_json", help="JSON instead of Markdown")
+    report.add_argument("--output", metavar="PATH", help="write the report to PATH (mode 0600)")
+
+    baseline_parser = sub.add_parser("baseline", help="record and compare system facts")
+    baseline_parser.add_argument("action", choices=["create", "compare", "show", "delete"])
+
+    changes_parser = sub.add_parser("changes", help="show what changed on this machine")
+    changes_parser.add_argument("--since", default=changes.DEFAULT_SINCE,
+                                metavar="VALUE",
+                                help="last-boot (default), today, yesterday, 48h, 7d, or a date")
+    changes_parser.add_argument("--web", action="store_true", help="research sanitized findings online")
+
+    watch = sub.add_parser("watch", help="sample one domain for a bounded window")
+    watch.add_argument("domain", choices=list(monitor.WATCHABLE))
+    watch.add_argument("--duration", type=int, default=monitor.DEFAULT_DURATION, metavar="SEC")
+    watch.add_argument("--interval", type=int, default=1, metavar="SEC")
+    watch.add_argument("--web", action="store_true",
+                       help="research sanitized findings once, after sampling finishes")
+
+    update = sub.add_parser("update", help="check for or install a verified SysAI release")
+    update.add_argument("action", nargs="?", default="apply", choices=["check", "apply"])
+
+    thinking = sub.add_parser("thinking", help="control the live reasoning display")
+    thinking.add_argument("state", choices=["on", "off", "status"])
+    sub.add_parser("stop", help="stop an active SysAI session")
+    return parser
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     if argv and argv[0] == "__hook":
@@ -285,34 +567,44 @@ def main(argv: list[str] | None = None) -> int:
         if not argv:
             # Preserve ordinary global argparse help/version behavior.
             return main(["--help"])
+        if argv[0] in RESERVED:
+            return main([argv[0], *(["--web"] if web else []), *argv[1:]])
         return insight_command(argv, raw=raw, web=web)
-    reserved = {"explain", "ask", "health", "stop", "thinking", "--help", "-h", "--version"}
-    if argv and argv[0] not in reserved:
+    if argv and argv[0] not in RESERVED:
         return insight_command(argv)
 
-    parser = argparse.ArgumentParser(prog="sysai", description="Local AI-aware Bash session")
-    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
-    sub = parser.add_subparsers(dest="command")
-    sub.add_parser("explain", help="analyze the most recently completed command")
-    ask_parser = sub.add_parser("ask", help="ask a local Ubuntu/Linux question")
-    ask_parser.add_argument("--web", action="store_true", help="research this sanitized question online")
-    ask_parser.add_argument("question", nargs="+")
-    health_parser = sub.add_parser("health", help="collect local Linux health diagnostics and explain them")
-    health_parser.add_argument("--web", action="store_true", help="research sanitized, concrete detected issues online")
-    sub.add_parser("stop", help="stop an active SysAI session")
-    thinking_parser = sub.add_parser("thinking", help="control the live reasoning display")
-    thinking_parser.add_argument("state", choices=["on", "off", "status"])
+    parser = build_parser()
     args = parser.parse_args(argv)
     if args.command == "explain":
         return _stream_session_request("explain")
+    if args.command == "investigate":
+        return investigate_command(web=args.web)
     if args.command == "ask":
         return _stream_session_request("ask", question=" ".join(args.question), web=args.web)
+    if args.command == "check":
+        return check_command(" ".join(args.question), web=args.web)
     if args.command == "health":
         return _stream_session_request("health", web=args.web)
-    if args.command == "stop":
-        return stop_outside()
+    if args.command == "doctor":
+        return doctor_command(args.as_json)
+    if args.command in DOMAINS:
+        return domain_command(args.command, web=args.web)
+    if args.command == "what":
+        return what_command(args.target)
+    if args.command == "report":
+        return report_command(args.scope, last=args.last, as_json=args.as_json, output=args.output)
+    if args.command == "baseline":
+        return baseline_command(args.action)
+    if args.command == "changes":
+        return changes_command(args.since, web=args.web)
+    if args.command == "watch":
+        return watch_command(args.domain, args.duration, args.interval, web=args.web)
+    if args.command == "update":
+        return update_command(args.action)
     if args.command == "thinking":
         return thinking_command(args.state)
+    if args.command == "stop":
+        return stop_outside()
     if os.environ.get("SYSAI_SESSION"):
         parser.print_help()
         return 0

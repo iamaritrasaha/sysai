@@ -21,11 +21,14 @@ from pathlib import Path
 
 from .config import Config, load_private_env, state_dir
 from .display import AnswerRenderer, plain_terminal_text, startup
-from .health import (action_catalogue, action_details, collect_health, parse_action_plan,
-                     run_action, safety_floor_actions, trusted_inventory, web_queries)
+from .evidence import CRITICAL, WARNING, build, model_signals
+from .health import (MAX_ROUNDS, SCOPES, action_catalogue, action_details, collect_health,
+                     parse_action_plan, run_action, safety_floor_actions,
+                     trusted_inventory, trusted_values, web_queries)
 from .insight import meaningful_anomaly, prepare_evidence, safe_research_query
+from .intent import classification_prompt, parse_domain
 from .ollama import OllamaCancelled, OllamaError, OllamaManager, StreamHandle
-from .prompt import failure_prompt, system_prompt
+from .prompt import assessment_prompt, failure_prompt, research_block, system_prompt
 from .redact import redact, truncate_output
 from .web import OllamaWebSearch, WebSearchError, sanitize_search_query
 
@@ -115,6 +118,9 @@ class Session:
         self.discussion: collections.deque[dict[str, str]] = collections.deque(maxlen=8)
         self.current: dict | None = None
         self.current_output = bytearray()
+        # Last completed diagnostic evidence document, for `sysai report --last`
+        # and `sysai investigate`. In-memory only; never written to disk.
+        self.last_result: dict | None = None
         self.child_pid: int | None = None
         self.stop_requested = threading.Event()
         self.server: socket.socket | None = None
@@ -202,7 +208,8 @@ class Session:
                     # `explain`/`ask` stream multiple newline-delimited JSON
                     # messages (thinking/content/done) as the model
                     # generates; everything else is a single request/response.
-                    if request.get("action") in ("explain", "ask", "health", "insight"):
+                    if request.get("action") in ("explain", "ask", "health", "insight",
+                                                 "assess", "investigate"):
                         self._control_stream(request, conn)
                         continue
                     try:
@@ -234,6 +241,21 @@ class Session:
                 except ProcessLookupError:
                     pass
             return {"ok": True, "message": "SysAI session stopping."}
+        if action == "last_result":
+            if self.last_result is None:
+                return {"ok": False, "error": "No diagnostic has completed in this session yet."}
+            return {"ok": True, "result": self.last_result}
+        if action == "classify":
+            question = redact(str(request.get("question", "")).strip())
+            if not question:
+                return {"ok": False, "error": "Please provide a question."}
+            try:
+                reply = self._ask_local(classification_prompt(question))
+            except (OllamaCancelled, OllamaError) as exc:
+                return {"ok": False, "error": str(exc)}
+            # Only an exact enum member is ever accepted from the model.
+            scope = parse_domain(reply)
+            return {"ok": True, "scope": scope, "accepted": scope is not None}
         if action == "get_thinking":
             return {"ok": True, "thinking": self.config.thinking}
         if action == "set_thinking":
@@ -300,41 +322,31 @@ class Session:
             return
         if action == "health":
             send({"type": "progress", "text": "SysAI Health\n• Collecting safe local diagnostics...\n"})
-            evidence = collect_health(lambda name: send({"type": "progress", "text": f"✓ {name.title()}\n"}))
-            health_signals = [{"kind": finding.get("kind"), "classification": finding.get("severity"),
-                               "count": 1, "line": json.dumps(finding.get("evidence", {}), sort_keys=True)}
-                              for finding in evidence.get("findings", [])]
-            diagnostic_evidence = {"command_family": "health", "signals": health_signals,
-                                   "output": json.dumps(evidence, sort_keys=True)}
-            diagnostics = self._adaptive_diagnostics(diagnostic_evidence, conn, send, handle)
-            if diagnostics:
-                evidence["additional_diagnostics"] = diagnostics
-            research = ""
-            if request.get("web"):
-                if not self.config.web_enabled:
-                    send({"type": "error", "error": "Web search is disabled. Set web_enabled = true in config.toml."})
-                    return
-                queries = web_queries(evidence)
-                if queries:
-                    send({"type": "progress", "text": "• Researching sanitized issue descriptions online...\n"})
-                    key = load_private_env().get("OLLAMA_API_KEY")
-                    try:
-                        results = []
-                        for query in queries:
-                            results.extend(OllamaWebSearch(key).search(sanitize_search_query(query))[:2])
-                    except WebSearchError as exc:
-                        send({"type": "progress", "text": f"• Web research unavailable: {exc}\n"})
-                    else:
-                        research = "\n\nWeb research (untrusted; derived only from generic issue labels, not local logs):\n" + "\n".join(
-                            f"- {item.get('title', '')} | {item.get('url', '')} | {item.get('content', '')[:800]}" for item in results[:5])
-            prompt = "Perform a Linux health assessment using ONLY this structured collector evidence. " \
-                "Start with 'SysAI Health' and Overall: Good, Attention needed, or Critical. Cover checked areas with ✓/!/–. " \
-                "For each issue state severity, exact supporting evidence, whether confirmed/probable/informational/unavailable, likely cause/confidence, safest next diagnostic, and a manual recommended fix only if supported. " \
-                "Never claim an uncollected check was inspected. Do not treat a command exit code alone as a fault. " \
-                "Do not propose automatic fixes. Never claim an action ran unless its result appears in additional_diagnostics. Missing utilities are NOT CHECKED. " \
-                "Normal Snap squashfs, errors=remount-ro as an unused mount policy, and normal AppArmor enforcement are not faults. " \
-                "Available audited diagnostic actions: " + json.dumps(action_catalogue()) + "\n\nStructured local evidence:\n" + json.dumps(evidence, sort_keys=True) + research
-            self._stream_answer(prompt, send, handle, remember_question=None)
+            document = collect_health(lambda name: send({"type": "progress", "text": f"✓ {name.title()}\n"}))
+            self._assess(document, conn, send, handle, web=bool(request.get("web")))
+            return
+        if action == "assess":
+            # The evidence was collected deterministically by the CLI and is
+            # rendered there; the session only reasons about it.
+            document = request.get("evidence")
+            scope = request.get("scope")
+            if not isinstance(document, dict) or not isinstance(scope, str):
+                send({"type": "error", "error": "Invalid diagnostic assessment request."})
+                return
+            if scope not in (*SCOPES, "changes", "watch", "system"):
+                send({"type": "error", "error": f"Unknown diagnostic scope: {scope}"})
+                return
+            rounds = MAX_ROUNDS if request.get("adaptive", True) else 0
+            self._assess(document, conn, send, handle, web=bool(request.get("web")), rounds=rounds)
+            return
+        if action == "investigate":
+            document = self._investigation_subject()
+            if document is None:
+                send({"type": "progress", "text": "SysAI: Nothing recent requires investigation.\n"})
+                send({"type": "done", "ok": True})
+                return
+            send({"type": "progress", "text": "SysAI Investigate\n• Gathering additional read-only evidence...\n"})
+            self._assess(document, conn, send, handle, web=bool(request.get("web")))
             return
         if action == "insight":
             argv = request.get("argv")
@@ -360,6 +372,13 @@ class Session:
                     research = "\n\nOnline research (untrusted):\n" + "\n".join(f"- {x.get('title', '')} | {x.get('url', '')}" for x in results[:3])
                 except WebSearchError as exc:
                     research = f"\n\nOnline research unavailable: {exc}"
+            self.last_result = build(
+                command="insight", scope="system",
+                sections={"inspection": {key: value for key, value in evidence.items()
+                                         if key != "signals"},
+                          "signals": evidence.get("signals", [])},
+                diagnostics=evidence.get("additional_diagnostics", []),
+                arguments={"argv": argv})
             prompt = "The command was explicitly requested by the user and executed by SysAI. Analyze only supplied evidence; do not invent system state or execute commands. " \
                 "The supplied evidence was intentionally truncated by SysAI when output_truncated is true. This is NOT evidence that the operating system, boot process, kernel, command, or log itself was truncated or failed. " \
                 "Normal hardware/firmware enumeration, AppArmor enforcement, service startup, and device discovery are informational unless supplied evidence explicitly indicates failure. Keyword matches alone are not proof. " \
@@ -371,12 +390,75 @@ class Session:
             return
         send({"type": "error", "error": f"Unknown session action: {action}"})
 
-    def _adaptive_diagnostics(self, evidence: dict, conn: socket.socket, send, handle: StreamHandle) -> list[dict]:
-        """Run at most three model-planned rounds through the audited action catalogue."""
+    def _assess(self, document: dict, conn: socket.socket, send, handle: StreamHandle,
+                *, web: bool = False, rounds: int = MAX_ROUNDS) -> None:
+        """Audited follow-up diagnostics, optional research, then one explanation."""
+        diagnostic_evidence = {
+            "command_family": document.get("request", {}).get("scope", "system"),
+            "signals": model_signals(document),
+            "findings": document.get("findings", []),
+            "output": json.dumps(document.get("sections", {}), sort_keys=True, default=str),
+        }
+        diagnostics = self._adaptive_diagnostics(
+            diagnostic_evidence, conn, send, handle, rounds=rounds,
+            extra_trusted=trusted_values(document)) if rounds else []
+        if diagnostics:
+            document = {**document, "diagnostics": diagnostics}
+        research = ""
+        if web:
+            if not self.config.web_enabled:
+                send({"type": "error", "error": "Web search is disabled. Set web_enabled = true in config.toml."})
+                return
+            queries = web_queries(document)
+            if queries:
+                send({"type": "progress", "text": "• Researching sanitized issue descriptions online...\n"})
+                key = load_private_env().get("OLLAMA_API_KEY")
+                results = []
+                try:
+                    for query in queries:
+                        results.extend(OllamaWebSearch(key).search(sanitize_search_query(query))[:2])
+                except WebSearchError as exc:
+                    send({"type": "progress", "text": f"• Web research unavailable: {exc}\n"})
+                else:
+                    research = research_block(results)
+        # Kept in memory only, for `sysai report --last` and `sysai investigate`.
+        self.last_result = document
+        prompt = assessment_prompt(document, research, catalogue=json.dumps(action_catalogue()))
+        self._stream_answer(prompt, send, handle, remember_question=None)
+
+    def _investigation_subject(self) -> dict | None:
+        """The most recent meaningful failed command, or the last serious finding."""
+        for record in reversed(self.records):
+            if record.get("exit_code") not in (0, None) and not record.get("interrupted"):
+                evidence = prepare_evidence(
+                    [part for part in record["command"].split() if part] or ["unknown"],
+                    {"exit_code": record.get("exit_code"), "output": record.get("output", ""),
+                     "truncated": False})
+                return build(
+                    command="investigate", scope="system",
+                    sections={"failure": {"command": record["command"],
+                                          "exit_code": record.get("exit_code"),
+                                          "working_directory": record.get("cwd"),
+                                          "timestamp": record.get("timestamp"),
+                                          "output": evidence.get("output", "")},
+                              "signals": evidence.get("signals", [])},
+                    findings=[])
+        if self.last_result and any(item.get("severity") in (WARNING, CRITICAL)
+                                    for item in self.last_result.get("findings", [])):
+            return {**self.last_result,
+                    "request": {**self.last_result.get("request", {}), "command": "investigate"}}
+        return None
+
+    def _adaptive_diagnostics(self, evidence: dict, conn: socket.socket, send, handle: StreamHandle,
+                              *, rounds: int = MAX_ROUNDS, extra_trusted: dict | None = None) -> list[dict]:
+        """Run at most `rounds` model-planned rounds through the audited action catalogue."""
         if not meaningful_anomaly(evidence):
             return []
         units = {match.group(0) for match in re.finditer(r"[A-Za-z0-9_.@-]+\.service", evidence.get("output", ""))}
-        trusted = trusted_inventory({"units": units})
+        inventory = {"units": units}
+        for key, values in (extra_trusted or {}).items():
+            inventory[key] = set(inventory.get(key, set())) | set(values)
+        trusted = trusted_inventory(inventory)
         results, completed = [], set()
         # Safety floor: run predefined non-elevated diagnostics for known
         # signal categories before the model planning loop so that useful
@@ -392,7 +474,7 @@ class Session:
                         results.append(result)
                 except ValueError:
                     pass
-        for _round in range(3):
+        for _round in range(max(0, rounds)):
             planning_prompt = (
                 "Select only additional read-only diagnostics that materially resolve uncertainty in this evidence. "
                 "Return JSON only as {\"actions\":[{\"id\":\"...\",\"params\":{}}]}; return {\"actions\":[]} when none are needed. "

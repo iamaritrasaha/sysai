@@ -67,15 +67,56 @@ Bash has no `preexec`/`precmd` hooks, so SysAI builds the equivalent lifecycle f
 
 - Real PTY-backed interactive Bash with prompts, colors, history, readline, completion, signals, sudo prompts, job control, and TUI support.
 - Automatic local analysis of unexpected non-zero command exits.
-- `sysai explain` for the most recently completed command, including successful commands.
-- `sysai ask` for general Linux questions with bounded recent context.
-- `sysai health` for a bounded, read-only local Linux health assessment; `sysai health --web` optionally researches sanitized detected issue labels.
-- Explicit, optional `sysai ask --web` research with sanitized queries only.
-- Common credential, authorization header, private-key, and secret-argument redaction.
+- Deterministic read-only diagnostics for eight domains, a full-system summary, plain-language questions, sanitized reports, baselines, change analysis, command explanation, deeper failure investigation, and bounded monitoring.
+- `sysai doctor` for SysAI's own installation, model, and runtime health.
+- Explicit, optional `--web` research with sanitized queries only.
+- Common credential, authorization header, private-key, and secret-argument redaction, plus stricter identity sanitization for anything written to disk.
 - Bounded in-memory transcripts with head-and-tail truncation for large output.
 - Ownership-aware Ollama startup and shutdown; no boot-time service changes.
 - Conservative ANSI output and `NO_COLOR` support.
 - Standard-library-only Python implementation with no package dependencies.
+
+**SysAI may autonomously collect ONLY validated read-only diagnostics. SysAI never autonomously applies repairs.**
+
+## CLI reference
+
+| Command | What it does |
+| --- | --- |
+| `sysai` | Start the AI-aware Bash session |
+| `sysai explain` | Explain the most recently completed command |
+| `sysai investigate [--web]` | Gather more safe evidence about the last failure, then explain it |
+| `sysai ask [--web] QUESTION` | Ask a local Linux question |
+| `sysai check [--web] QUESTION` | Answer a plain-language question about this machine |
+| `sysai health [--web]` | Every diagnostic domain, summarized |
+| `sysai doctor [--json]` | Diagnose SysAI itself |
+| `sysai gpu\|memory\|disk\|network\|boot\|services\|packages\|thermal [--web]` | One domain in depth |
+| `sysai what COMMAND` | Explain a command without running it |
+| `sysai report [SCOPE] [--last] [--json] [--output PATH]` | Sanitized diagnostic report |
+| `sysai baseline create\|compare\|show\|delete` | Record and compare deterministic system facts |
+| `sysai changes [--since VALUE] [--web]` | What changed on this machine, and when |
+| `sysai watch DOMAIN [--duration SEC] [--interval SEC] [--web]` | Bounded foreground sampling |
+| `sysai update check\|update` | Check for, or install, a checksum-verified SysAI release |
+| `sysai thinking on\|off\|status` | Control the live reasoning display |
+| `sysai stop` | Stop an active SysAI session |
+| `sysai <read-only command>` | Command Insight Mode (`sysai dmesg`, `sysai --raw journalctl -b`, `sysai sudo dmesg`) |
+
+Commands that display model prose (`health`, the domain commands, `check`, `changes`, `watch`, `investigate`, `report --last`) use the active SysAI session's local model. The deterministic evidence is collected and rendered either way; without a session, SysAI prints the facts and says the assessment is unavailable.
+
+## Diagnostic architecture
+
+```text
+deterministic collectors      fixed argv, no shell, bounded output
+          ↓
+audited diagnostic engine     action IDs only, validated parameters, consent for elevated
+          ↓
+local Qwen reasoning          explains evidence; never invents or executes commands
+          ↓
+manual repair recommendation  shown for you to run yourself
+```
+
+Every diagnostic produces one canonical evidence document: request, system summary, normalized sections, findings, diagnostics performed, checks that were not available, timestamp, and a privacy note. Findings are computed in Python — severity, counts, thresholds — so the model is never asked to derive a fact that can be calculated. Each finding carries an id, domain, severity, classification (CONFIRMED, PROBABLE, POSSIBLE, INFORMATIONAL, NOT CHECKED), evidence, count, confidence, probable cause, what remains unverified, and a suggested next diagnostic.
+
+The model may be asked which audited action **IDs** would reduce uncertainty. It can never supply argv. Unknown IDs and parameters that did not come from a collector are rejected.
 
 ## Requirements
 
@@ -195,9 +236,136 @@ sysai health
 sysai health --web
 ```
 
-Health concurrently collects bounded, read-only local evidence (OS/kernel, CPU/load, memory/swap, storage/inodes/mount state, services, kernel errors/OOM, packages, network/DNS/routes, time, processes, GPU/AMD/ROCm where available, and thermal sensors) before asking the local model to explain it. Missing utilities become NOT CHECKED. Health never applies a fix. `--web` remains optional and only sends generic, sanitized issue descriptions—not logs, paths, hostnames, addresses, serials, or terminal context.
+Health runs every domain collector concurrently and summarizes them: OS/kernel, GPU/driver, memory/swap/OOM, storage/inodes/mount state and I/O errors, services, boot, packages, network/DNS/routes, and thermal sensors. Missing utilities become NOT CHECKED. Health never applies a fix. `--web` sends only generic, sanitized issue labels — not logs, paths, hostnames, addresses, serials, or terminal context.
 
-When deeper evidence is needed, SysAI's small diagnostic-action catalogue validates the action and collector-derived parameters before it can run. Elevated read-only actions (for example SMART inspection) require an explicit one-time `[y/N]` approval; refusal leaves the assessment at reduced confidence. Repairs are always suggestions for you to run manually.
+### Diagnose one domain
+
+```sh
+sysai gpu
+sysai memory --web
+sysai disk
+sysai network
+sysai boot
+sysai services
+sysai packages
+sysai thermal
+```
+
+Each command runs its domain's deterministic collectors, prints the facts directly, and then asks the local model to explain them. GPU collection is vendor-neutral: it consults only the tooling matching the hardware actually present, and never suggests NVIDIA utilities for an AMD or Intel GPU. SMART inspection stays elevated and approval-gated, and `fsck` is never run. Services are never restarted, enabled, or disabled; packages are never installed, upgraded, or removed. Sensors that a machine does not expose are NOT CHECKED, not a failure.
+
+### Ask in plain language
+
+```sh
+sysai check "why is my PC slow?"
+sysai check "why does my internet disconnect?"
+sysai check "is my GPU okay?"
+sysai check why is boot slow
+```
+
+`check` routes a question to one approved scope. Routing is deterministic keyword matching first; only a genuinely ambiguous question is put to the local model, and its reply must be one name from a strict enum (`gpu`, `memory`, `disk`, `network`, `boot`, `services`, `packages`, `thermal`, `full_system`) or it is discarded and the question falls back to a full-system scan. The model cannot invent a diagnostic or name a command.
+
+### Explain a command without running it
+
+```sh
+sysai what "sudo apt autoremove"
+sysai what "find /var -type f -size +1G"
+```
+
+`what` is explanation only: the command is tokenized with `shlex` for analysis and display and is **never executed**. It reports the program and its significant arguments, what is read, what is changed, privilege level, risk, reversibility, any dangerous parts, and a safer preview or dry-run alternative where one exists. Model-suggested alternatives, when shown, remain suggestions.
+
+### Investigate a failure
+
+```sh
+sysai investigate
+sysai investigate --web
+```
+
+`sysai explain` reasons about evidence that already exists. `sysai investigate` first gathers **additional safe read-only evidence** through the audited action catalogue — bounded rounds, the same privilege rules, one-time approval for elevated read-only checks — and only then produces an assessment. No repair action exists in the catalogue. With no recent failure or serious finding, SysAI says so and stops.
+
+### Watch a domain for a bounded window
+
+```sh
+sysai watch gpu
+sysai watch memory --duration 60 --interval 2
+sysai watch thermal --duration 30
+```
+
+Watch samples `gpu`, `memory`, `network`, `thermal`, or `system` in the foreground for a bounded window: 30 seconds by default, 300 seconds maximum, minimum interval one second. Ctrl+C stops cleanly and still produces a summary. There is no daemon, background service, timer, or startup unit. Samples stay in memory, Python computes the minimum/maximum/change summary and correlates kernel events occurring during the window, and the local model is called exactly once at the end. With `--web`, a single sanitized research pass runs after sampling finishes, never during it.
+
+### Reports
+
+```sh
+sysai report
+sysai report gpu
+sysai report --last
+sysai report network --json
+sysai report gpu --output report.md
+```
+
+Reports render the canonical evidence as Markdown (or `--json`) with sections for generation time, scope, system summary, findings, evidence, diagnostics performed, what was **not** checked, confidence, recommended next steps, and a privacy note. Every report is re-sanitized at the strict level first: usernames, home paths, hostnames, IP and MAC addresses, serial numbers, UUIDs, tokens, and keys are removed. `--last` uses the last completed diagnostic from the running SysAI session. Nothing is written to disk unless `--output` names a path, and files are created mode `0600`.
+
+### Baselines
+
+```sh
+sysai baseline create
+sysai baseline compare
+sysai baseline show
+sysai baseline delete
+```
+
+A baseline is a single sanitized snapshot of deterministic facts — kernel, OS, GPU/driver identity, memory size, filesystems, interface names and types, failed-service summary, boot health, selected package versions, installed count, and the SysAI version. It never contains terminal history, model reasoning, raw `dmesg` or journal text, secrets, addresses, MACs, or serials. It is written atomically, mode `0600`, to `$XDG_STATE_HOME/sysai/baseline.json` (default `~/.local/state/sysai/`); a corrupt or schema-mismatched file is reported rather than misread.
+
+`compare` computes the differences in Python, and the model may explain them afterwards:
+
+```text
+Changed since baseline
+
+Kernel
+  7.0.0-29-generic -> 7.0.0-30-generic
+
+mesa-vulkan-drivers
+  26.0.7 -> 26.0.8
+
+Failed services
+  0 -> 1
+```
+
+### What changed
+
+```sh
+sysai changes
+sysai changes --since last-boot
+sysai changes --since yesterday
+sysai changes --since "2026-08-20"
+sysai changes --web
+```
+
+`changes` answers "what changed before my machine started behaving differently?". It parses APT history, the dpkg log, kernel and driver package changes, reboot history, current service failures, and the modification times of files directly under `/etc`. It does not scan the filesystem and does not read private document contents. The default window is the current boot. Timestamps are parsed deterministically, and correlation is reported as correlation: "this changed shortly before the first observed failure", never as cause.
+
+### Diagnose SysAI itself
+
+```sh
+sysai doctor
+sysai doctor --json
+```
+
+`doctor` checks SysAI rather than the machine: Python and Bash versions, install location and version, whether an installed copy still matches the repository checkout, config and private-env readability and permissions, web configuration and whether an API key exists (never its value), the Ollama binary, local API reachability, the configured model and whether it responds, reasoning support, session and runtime state including stale `active.json`, Bash integration syntax, `~/.bashrc` readability and whether anything added a SysAI reference to it, free disk space, GPU visibility as information only, and renderer sanity. It exits non-zero when a check needs attention.
+
+### Update SysAI
+
+```sh
+sysai update check
+sysai update
+```
+
+This updates SysAI only. It never runs `apt upgrade`, never updates Ubuntu, Ollama, or the local model, never pulls from a branch, and never pipes a download into a shell. `update check` reads published release metadata and reports the version and summary without changing anything. `sysai update` installs a release only when it can verify it: the release must publish both an artifact and a `SHA256SUMS` (or equivalent) manifest, the download must match the recorded digest, and the archive must contain no traversal or link entries. Otherwise SysAI reports:
+
+```text
+SysAI: A newer release exists, but automatic update is unavailable
+because no verifiable release artifact/checksum is published.
+```
+
+and prints manual instructions. A development checkout is never updated in place, and a checkout with uncommitted changes is refused explicitly.
 
 ### Request web research
 
@@ -221,6 +389,8 @@ sysai ask --web "current Ubuntu kernel regression affecting suspend"
 ```
 
 Only the explicit question is normalized, redacted, stripped of control characters, and limited to 500 characters before web search. Raw terminal output and recent terminal context are never sent to the provider.
+
+`--web` is accepted by `ask`, `health`, the eight domain commands, `check`, `changes`, `investigate`, and `watch` (post-sampling only). For diagnostics, the query is built from generic finding labels and normalized facts — never from raw telemetry, hostnames, usernames, paths, terminal logs, IP or MAC addresses, serial numbers, or model reasoning. Online results are labelled secondary and untrusted and can never establish local system state.
 
 ### Stop SysAI
 
@@ -275,10 +445,31 @@ Edit `~/.config/sysai/config.toml` and restart SysAI, or use `sysai thinking on|
 - PTY output and hook events travel over separate file descriptors, preventing ordinary terminal output from becoming internal protocol data.
 - Web search is disabled by default and never receives a raw terminal transcript or model reasoning text — only an explicit, sanitized user question.
 - Health diagnostics use an audited fixed read-only allowlist with bounded timeouts; model suggestions, including repairs, are never executed.
+- One canonical sanitization layer serves every structured diagnostic. On-screen local output removes secrets; anything written to disk or sent to a search provider additionally removes usernames, home paths, hostnames, IP and MAC addresses, serial numbers, and UUIDs.
+- Findings are computed in Python. The model explains evidence; it never derives a deterministic fact, contributes a finding, or supplies an executable command. Diagnostic action IDs are validated against a fixed argv table, and their parameters must come from a collector.
+- Repairs are never executed. No mutating action exists in the diagnostic catalogue: services are not restarted, enabled, or disabled, packages are not installed, upgraded, or removed, and `fsck` is never run.
+- Self-update installs only a release whose artifact matches a published checksum manifest. It never pulls a branch, never pipes a download into a shell, and never updates a development checkout in place.
+- `sysai watch` is foreground and bounded. There is no daemon, background service, timer, or startup unit, and samples are discarded once the summary is produced.
 - Secret redaction is defense in depth, not a guarantee. Avoid printing secrets and revoke any credential that may have appeared in a terminal.
 - Qwen can be mistaken, in its reasoning as well as its final answer. Review every suggested command, especially commands involving `sudo`, deletion, permissions, disks, packages, services, boot, `/etc`, or networking.
 
 See [`SECURITY.md`](SECURITY.md) for vulnerability reporting.
+
+## What SysAI keeps
+
+SysAI is memory-only by default. Recent command context, captured output, diagnostic evidence, model reasoning, and watch samples exist only in bounded process memory and disappear when the session ends. Nothing writes a shell-history copy, a command transcript, reasoning text, raw health logs, or retained telemetry.
+
+Only these files are ever written, and only for the reasons given:
+
+| Path | Written by | Contents |
+| --- | --- | --- |
+| `~/.config/sysai/config.toml` | installer, `sysai thinking on\|off` | settings, mode `0600` |
+| `~/.config/sysai/env` | you | the optional web-search key, mode `0600` |
+| `$XDG_STATE_HOME/sysai/baseline.json` | `sysai baseline create` | sanitized deterministic facts, mode `0600`, atomic |
+| the path you pass to `--output` | `sysai report --output PATH` | a sanitized report, mode `0600`, atomic |
+| `$XDG_RUNTIME_DIR/sysai/` | an active session | control socket and ownership state, mode `0700`/`0600` |
+
+`sysai report` prints to the terminal unless `--output` names a path; no file is created silently.
 
 ## Troubleshooting
 
@@ -323,6 +514,9 @@ Confirm `web_enabled = true` and that `~/.config/sysai/env` contains a valid `OL
 - Redaction cannot identify every proprietary or newly invented credential format.
 - A local process running as the same user can generally inspect or interfere with that user's processes; SysAI does not claim to sandbox manually executed commands.
 - v0.1.0 supports one active SysAI session per user. A private runtime lock rejects a second session to keep stop and Ollama ownership unambiguous.
+- Model-backed assessment needs a running SysAI session. Deterministic diagnostics, `sysai doctor`, `sysai what`, `sysai report`, `sysai baseline`, and `sysai update check` work without one.
+- `sysai changes` reads package and boot history, not arbitrary file contents, so a change made outside a package manager and outside `/etc` is not visible to it.
+- Automatic self-update requires the release to publish a checksum manifest. Until one exists, `sysai update` reports that and gives manual instructions.
 - Linux is currently required. macOS, BSD, and Windows are not supported in v0.1.0.
 
 ## Development and testing

@@ -6,7 +6,35 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- `sysai doctor` (and `sysai doctor --json`): a deterministic self-diagnosis of SysAI itself — Python and Bash versions, install location and version, installed-copy vs repository drift, config and private-env readability and permissions, web configuration and API-key presence (never its value), Ollama binary and API reachability, configured model presence and response, reasoning support, session and runtime state including stale `active.json`, Bash integration syntax, `~/.bashrc` readability and whether anything added a SysAI reference to it, free disk space, GPU visibility as information only, and renderer sanity.
+- Domain diagnostics: `sysai gpu`, `sysai memory`, `sysai disk`, `sysai network`, `sysai boot`, `sysai services`, `sysai packages`, and `sysai thermal`, each with optional `--web`. GPU collection is vendor-neutral and never suggests another vendor's tooling. SMART inspection stays elevated and approval-gated; `fsck` is never run; services are never restarted, enabled, or disabled; packages are never installed, upgraded, or removed. Unavailable sensors and utilities are NOT CHECKED, not failures.
+- `sysai check "..."`: plain-language routing to one approved diagnostic scope. Deterministic word-boundary keyword matching decides first; a genuinely ambiguous question may be classified by the local model, whose reply must match a strict enum or be discarded in favour of a full-system scan. The model can never invent a diagnostic or name a command.
+- `sysai report [SCOPE] [--last] [--json] [--output PATH]`: sanitized Markdown or JSON reports covering generation time, scope, system summary, findings, evidence, diagnostics performed, what was not checked, confidence, recommended next steps, and a privacy note. Nothing is written unless `--output` names a path; files are created mode `0600` and atomically.
+- `sysai baseline create|compare|show|delete`: a sanitized snapshot of deterministic system facts in `$XDG_STATE_HOME/sysai/baseline.json`, written atomically with mode `0600`, with schema versioning and corruption handling. Differences are computed in Python; the model may explain them afterwards.
+- `sysai changes [--since VALUE] [--web]`: APT history, dpkg log, kernel and driver package changes, reboot history, current service failures, and `/etc` modification times over a bounded window (default: the current boot). Timestamps are parsed deterministically and temporal ordering is reported as correlation, never as cause.
+- `sysai what COMMAND`: explanation only. The command is tokenized with `shlex` for analysis and display and is never executed. Reports the program, significant arguments, what is read and changed, privilege, risk, reversibility, dangerous parts, and a safer preview or dry-run alternative.
+- `sysai investigate [--web]`: gathers additional safe read-only evidence through the audited action catalogue before explaining the most recent failure or serious finding, with bounded rounds and unchanged privilege rules. Reports plainly when nothing recent requires investigation.
+- `sysai watch DOMAIN [--duration SEC] [--interval SEC] [--web]`: bounded foreground sampling of `gpu`, `memory`, `network`, `thermal`, or `system` — 30 seconds by default, 300 maximum, minimum interval one second, Ctrl+C stops cleanly. No daemon, background service, timer, or startup unit. Samples stay in memory, Python computes the summary and correlates kernel events during the window, and the local model is called exactly once afterwards.
+- `sysai update check` and `sysai update`: SysAI self-update only. Never touches the operating system, APT, Ollama, or the local model. An update installs only from a release artifact that matches a published checksum manifest, with archive traversal and link entries rejected; without a verifiable artifact SysAI says so and prints manual instructions. It never pulls a branch, never pipes a download into a shell, and never updates a development checkout in place.
+- One canonical evidence document shared by every diagnostic: schema version, request, system summary, sections, findings, diagnostics, unavailable checks, timestamp, and privacy note. Findings carry id, domain, severity, classification, evidence, count, confidence, probable cause, what remains unverified, and a suggested next diagnostic.
+- One canonical sanitization layer with two levels: on-screen local output removes secrets, while anything written to disk or sent to a search provider additionally removes usernames, home paths, hostnames, IP and MAC addresses, serial numbers, and UUIDs. Log timestamps and PCI addresses are deliberately preserved as useful, non-identifying evidence.
+- Additional audited diagnostic action IDs covering memory, filesystem capacity and inodes, block layout, listening sockets, boot timing and blame, failed-unit listing, held packages, and vendor-appropriate GPU tooling.
+
 ### Changed
+
+- `sysai health` is now every domain summarized, sharing the collectors, findings engine, evidence schema, and audited action catalogue with the individual domain commands. The command and its `--web` flag are unchanged.
+- Diagnostic collection is split into reusable modules — `collect`, `domains`, `diagnostics`, `evidence`, `privacy`, `render`, `intent`, `doctor`, `reports`, `baseline`, `changes`, `monitor`, `updater`, `whatis` — and `health.py` is now the facade over them rather than a separate implementation.
+- Findings, severities, and thresholds are computed in Python rather than inferred by the model; the model explains evidence and never derives a deterministic fact.
+- Growing log files (`dpkg.log`, APT history) are read from the end, so history parsing sees the newest entries rather than the oldest.
+- Every new command word is reserved in the CLI, so `sysai disk` is the disk diagnostic rather than an attempt to inspect a program called `disk`. Existing Command Insight forms (`sysai dmesg`, `sysai --web dmesg`, `sysai --raw dmesg`, `sysai sudo dmesg`) are unchanged.
+
+### Fixed
+
+- `test_stream_box_output_remains_prefixed_through_a_pty` was flaky: it performed a single read of a PTY master, which can return only the first chunk. It now drains the master until EOF on a reader thread, making the captured output deterministic without retries or sleeps.
+
+### Changed (Bash migration)
 
 - SysAI is now Bash-native. The monitored session is a real interactive Bash started with fixed argv as `bash --rcfile <temporary-file> -i`, replacing the previous Zsh session. Bash 5.x is the runtime requirement; Zsh is no longer required, installed, or supported.
 - Command lifecycle metadata now comes from a guarded Bash `DEBUG` trap (command start) and `PROMPT_COMMAND` (completion and real exit status), replacing Zsh's `preexec`/`precmd`. One top-level entry produces exactly one record: pipelines, `&&`/`||` lists, multi-line compound commands, and shell functions are not split, and SysAI's own hooks never record themselves.

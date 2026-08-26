@@ -47,6 +47,26 @@ def state_dir() -> Path:
     return path
 
 
+def persistent_state_dir() -> Path:
+    """XDG state directory for explicit, long-lived files (baselines, caches).
+
+    Deliberately separate from `state_dir()`, which is volatile per-boot
+    runtime state, and from the config directory, which holds settings the
+    user edits rather than data SysAI writes.
+    """
+    base = os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state")
+    path = Path(base) / "sysai"
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    info = path.lstat()
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise RuntimeError(f"Unsafe SysAI state path (not a real directory): {path}")
+    if info.st_uid != os.getuid():
+        raise RuntimeError(f"Unsafe SysAI state path (wrong owner): {path}")
+    if info.st_mode & 0o077:
+        path.chmod(0o700)
+    return path
+
+
 def load_config(path: Path | None = None) -> Config:
     path = path or config_dir() / "config.toml"
     if not path.exists():

@@ -163,15 +163,35 @@ class EndToEndRenderingTests(unittest.TestCase):
 
     def test_stream_box_output_remains_prefixed_through_a_pty(self):
         master, slave = os.openpty()
+        collected = bytearray()
+
+        def drain() -> None:
+            # A PTY master delivers whatever the line discipline has flipped so
+            # far, so a single read can return only the first chunk. Draining
+            # until EOF (raised as EIO once the slave is closed) makes the
+            # captured output deterministic instead of timing-dependent.
+            while True:
+                try:
+                    chunk = os.read(master, 65536)
+                except OSError:
+                    return
+                if not chunk:
+                    return
+                collected.extend(chunk)
+
+        reader = threading.Thread(target=drain)
+        reader.start()
         try:
             with mock.patch("sysai.display.shutil.get_terminal_size", return_value=os.terminal_size((28, 24))):
                 renderer = AnswerRenderer(lambda value: os.write(slave, value.encode()))
                 renderer.content("1. **A deliberately long diagnostic heading that wraps**\n")
                 renderer.finish()
-            output = os.read(master, 65536).decode().replace("\r\n", "\n")
         finally:
-            os.close(master)
             os.close(slave)
+            reader.join(timeout=5)
+            os.close(master)
+        self.assertFalse(reader.is_alive())
+        output = collected.decode().replace("\r\n", "\n")
         content = [line for line in visible(output).splitlines() if line.startswith("│")]
         self.assertGreater(len(content), 1)
         self.assertTrue(all(line.startswith("│ ") and len(line) <= 27 for line in content))

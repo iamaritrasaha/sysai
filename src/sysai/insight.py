@@ -176,8 +176,11 @@ def prepare_evidence(argv: list[str], result: dict, limit: int = 10000) -> dict:
     }
 
 
+_MEANINGFUL = ("possible", "warning", "probable", "confirmed", "critical")
+
+
 def meaningful_anomaly(evidence: dict) -> bool:
-    return any(signal.get("classification") in ("possible", "warning", "probable", "confirmed")
+    return any(str(signal.get("classification", "")).lower() in _MEANINGFUL
                for signal in evidence.get("signals", []))
 
 
