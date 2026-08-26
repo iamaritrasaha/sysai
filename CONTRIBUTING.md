@@ -4,13 +4,13 @@ Contributions are welcome through issues and pull requests.
 
 ## Development setup
 
-SysAI requires Linux, Python 3.11 or newer, and Zsh. Unit tests do not require Ollama, a GPU, ROCm, an account, or API keys.
+SysAI requires Linux, Python 3.11 or newer, and Bash 5.x. Unit tests do not require Ollama, a GPU, ROCm, an account, or API keys.
 
 ```sh
 PYTHONPATH=src python3 -m unittest discover -s tests -v
 python3 -m compileall -q src tests
 sh -n bin/sysai install.sh uninstall.sh scripts/manual-integration-test.sh
-zsh -n src/sysai/integration.zsh
+bash -n src/sysai/integration.bash
 ```
 
 Run `scripts/manual-integration-test.sh` separately when a local Ollama server and the configured model are available.

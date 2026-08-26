@@ -290,7 +290,7 @@ def main(argv: list[str] | None = None) -> int:
     if argv and argv[0] not in reserved:
         return insight_command(argv)
 
-    parser = argparse.ArgumentParser(prog="sysai", description="Local AI-aware Zsh session")
+    parser = argparse.ArgumentParser(prog="sysai", description="Local AI-aware Bash session")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     sub = parser.add_subparsers(dest="command")
     sub.add_parser("explain", help="analyze the most recently completed command")

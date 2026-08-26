@@ -7,7 +7,7 @@ trap 'rm -rf -- "$RUN_DIR"' EXIT HUP INT TERM
 mkdir -p "$RUN_DIR/sysai"
 cp "$PROJECT_DIR/config/default.toml" "$RUN_DIR/sysai/config.toml"
 
-printf '%s\n' "Starting a real PTY-backed SysAI/Zsh integration test."
+printf '%s\n' "Starting a real PTY-backed SysAI/Bash integration test."
 printf '%s\n' "It runs one success, one exit-7 failure, then 'sysai explain', then exits."
 printf '%s\n' "The failure and explain invoke local Qwen; if the configured model exposes"
 printf '%s\n' "reasoning, a live 'SysAI . thinking' box streams before each answer."

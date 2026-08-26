@@ -20,13 +20,28 @@ for managed_path in "$INSTALL_ROOT" "$INSTALL_ROOT/lib" "$LIB_DIR" "$BIN_DIR" "$
   fi
 done
 
+if [ -x /bin/bash ]; then
+  BASH_BIN=/bin/bash
+else
+  BASH_BIN=$(command -v bash 2>/dev/null || true)
+fi
+if [ -z "$BASH_BIN" ]; then
+  printf '%s\n' "SysAI requires Bash 5.x, but no bash executable was found." >&2
+  exit 1
+fi
+BASH_MAJOR=$("$BASH_BIN" --version 2>/dev/null | sed -n '1s/^GNU bash, version \([0-9][0-9]*\).*/\1/p')
+if [ -n "$BASH_MAJOR" ] && [ "$BASH_MAJOR" -lt 5 ]; then
+  printf '%s\n' "SysAI requires Bash 5.x; found version $BASH_MAJOR at $BASH_BIN." >&2
+  exit 1
+fi
+
 mkdir -p "$INSTALL_ROOT/lib" "$BIN_DIR" "$CONFIG_DIR"
 STAGE_DIR=$(mktemp -d "$INSTALL_ROOT/lib/.sysai-terminal.XXXXXX")
 STAGE_BIN=$(mktemp "$BIN_DIR/.sysai.XXXXXX")
 trap 'rm -rf -- "$STAGE_DIR"; rm -f -- "$STAGE_BIN"' EXIT HUP INT TERM
 mkdir "$STAGE_DIR/sysai"
 cp "$PROJECT_DIR"/src/sysai/*.py "$STAGE_DIR/sysai/"
-cp "$PROJECT_DIR"/src/sysai/*.md "$PROJECT_DIR"/src/sysai/*.zsh "$STAGE_DIR/sysai/"
+cp "$PROJECT_DIR"/src/sysai/*.md "$PROJECT_DIR"/src/sysai/*.bash "$STAGE_DIR/sysai/"
 cp "$PROJECT_DIR/bin/sysai" "$STAGE_BIN"
 chmod 755 "$STAGE_DIR" "$STAGE_DIR/sysai"
 chmod 644 "$STAGE_DIR/sysai"/*
@@ -50,4 +65,4 @@ case ":$PATH:" in
   *":$BIN_DIR:"*) ;;
   *) printf '%s\n' "Add $BIN_DIR to PATH if it is not already available." ;;
 esac
-printf '%s\n' "No changes were made to .zshrc."
+printf '%s\n' "No changes were made to ~/.bashrc, ~/.profile, or ~/.bash_profile."

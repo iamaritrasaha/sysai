@@ -11,6 +11,7 @@ import pty
 import re
 import selectors
 import shlex
+import shutil
 import signal
 import socket
 import tempfile
@@ -44,6 +45,46 @@ def _safe_write(fd: int, data: bytes) -> None:
             if exc.errno not in (errno.EIO, errno.EBADF):
                 raise
             return
+
+
+def bash_executable() -> str:
+    """Resolve the Bash that SysAI runs.
+
+    SysAI is Bash-native: it never launches the user's arbitrary `$SHELL`.
+    `/bin/bash` is preferred, with a PATH lookup as the fallback for
+    distributions that place Bash elsewhere.
+    """
+    if os.access("/bin/bash", os.X_OK):
+        return "/bin/bash"
+    found = shutil.which("bash")
+    if found:
+        return found
+    raise RuntimeError("SysAI requires Bash 5.x, but no `bash` executable was found.")
+
+
+def write_session_rcfile(directory: Path) -> Path:
+    """Write the temporary, session-only Bash rcfile.
+
+    SysAI never modifies `~/.bashrc`, `~/.profile`, or `~/.bash_profile`.
+    Bash is started with `--rcfile`, which replaces `~/.bashrc` for this
+    session only; the file below sources the user's own `~/.bashrc` first
+    and then SysAI's session-only monitoring hooks. It is removed when the
+    session ends.
+    """
+    integration = Path(__file__).with_name("integration.bash")
+    user_bashrc = Path.home() / ".bashrc"
+    lines = ["# Temporary SysAI session rcfile. Created per session, removed on exit."]
+    if user_bashrc.exists():
+        quoted = shlex.quote(str(user_bashrc))
+        lines.extend([f"if [ -r {quoted} ]; then", f"  . {quoted}", "fi"])
+    # `trap -p DEBUG` reports nothing once a sourced file is running, so the
+    # pre-existing trap is captured here, at the rcfile's own top level.
+    lines.append("__sysai_previous_debug_trap=$(trap -p DEBUG)")
+    lines.append(f". {shlex.quote(str(integration))}")
+    rcfile = directory / "sysai.bashrc"
+    rcfile.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    rcfile.chmod(0o600)
+    return rcfile
 
 
 def should_analyze(command: str, status: int) -> bool:
@@ -180,7 +221,7 @@ class Session:
     def _control(self, request: dict) -> dict:
         action = request.get("action")
         if action == "leave":
-            # The in-session Zsh function exits itself after receiving this reply.
+            # The in-session Bash function exits itself after receiving this reply.
             return {
                 "ok": True,
                 "message": "SysAI stopped.\nQwen unloaded; SysAI-owned Ollama shut down when applicable.\nGoodbye 👋",
@@ -566,26 +607,25 @@ class Session:
         response_r, response_w = os.pipe()
         for fd in (event_w, response_r):
             os.set_inheritable(fd, True)
-        integration = Path(__file__).with_name("integration.zsh")
-        with tempfile.TemporaryDirectory(prefix="sysai-zdot-") as temp:
-            wrapper = Path(temp) / ".zshrc"
-            user_zshrc = Path.home() / ".zshrc"
-            lines = []
-            if user_zshrc.exists():
-                lines.append(f"source {shlex.quote(str(user_zshrc))}")
-            lines.append(f"source {shlex.quote(str(integration))}")
-            wrapper.write_text("\n".join(lines) + "\n", encoding="utf-8")
-            wrapper.chmod(0o600)
+        bash = bash_executable()
+        with tempfile.TemporaryDirectory(prefix="sysai-bash-") as temp:
+            rcfile = write_session_rcfile(Path(temp))
             pid, master = pty.fork()
             if pid == 0:
-                os.close(event_r)
-                os.close(response_w)
-                os.environ.update({
-                    "ZDOTDIR": temp, "SYSAI_SESSION": "1",
-                    "SYSAI_EVENT_FD": str(event_w), "SYSAI_RESPONSE_FD": str(response_r),
-                    "SYSAI_SOCKET": str(self.socket_path), "SYSAI_EXECUTABLE": self.executable,
-                })
-                os.execvp("zsh", ["zsh", "-i"])
+                try:
+                    os.close(event_r)
+                    os.close(response_w)
+                    os.environ.update({
+                        "SYSAI_SESSION": "1",
+                        "SYSAI_EVENT_FD": str(event_w), "SYSAI_RESPONSE_FD": str(response_r),
+                        "SYSAI_SOCKET": str(self.socket_path), "SYSAI_EXECUTABLE": self.executable,
+                    })
+                    # Fixed argv: the user's typed shell text is never an
+                    # argument here, and `--rcfile` keeps the integration
+                    # session-only instead of editing ~/.bashrc.
+                    os.execv(bash, [bash, "--rcfile", str(rcfile), "-i"])
+                except BaseException:  # pragma: no cover - exec almost never fails
+                    os._exit(127)
             self.child_pid = pid
             os.close(event_w)
             os.close(response_r)
