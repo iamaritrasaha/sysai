@@ -24,6 +24,13 @@ class Config:
     web_provider: str = "ollama"
     request_timeout_seconds: int = 120
     startup_timeout_seconds: int = 20
+    # History intelligence (see history.py). Safety limits (max_entries,
+    # max_context_entries) apply regardless of mode.
+    history_enabled: bool = True
+    history_mode: str = "relevant"
+    history_max_entries: int = 300
+    history_lookback_hours: int = 48
+    history_max_context_entries: int = 20
 
 
 def config_dir() -> Path:

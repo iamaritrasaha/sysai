@@ -8,6 +8,8 @@ import socket
 import sys
 
 from . import __version__, baseline, changes, monitor, reports, updater, whatis
+from . import history as history_mod
+from . import memory as memory_mod
 from .collect import run as _command
 from .config import load_config, set_config_value, state_dir
 from .diagnostics import action_details, prompt_permission
@@ -477,12 +479,136 @@ def update_command(action: str) -> int:
     return 1
 
 
+def history_command(*, all_mode: bool = False, as_json: bool = False) -> int:
+    config = load_config()
+    mode = history_mod.MODE_ALL if all_mode else config.history_mode
+    if not config.history_enabled:
+        mode = history_mod.MODE_OFF
+    entries, ignored = history_mod.relevant_history(
+        [], "system", mode=mode, lookback_hours=config.history_lookback_hours,
+        max_entries=config.history_max_entries,
+        max_context_entries=config.history_max_context_entries)
+    if as_json:
+        print(json.dumps({"mode": mode, "ignored_count": ignored, "entries": entries}, sort_keys=True))
+        return 0
+    _write(history_mod.render_history(entries, ignored, all_mode=all_mode))
+    return 0
+
+
+def memory_command(args: list[str]) -> int:
+    action = args[0] if args else "list"
+    rest = args[1:]
+    if action == "list":
+        _write(memory_mod.render_memory_list(memory_mod.list_memories()))
+        return 0
+    if action == "stats":
+        _write(memory_mod.render_memory_overview())
+        return 0
+    if action == "search":
+        query = " ".join(rest)
+        if not query:
+            print("SysAI: Please provide a search query.", file=sys.stderr)
+            return 2
+        _write(memory_mod.render_memory_list(memory_mod.search(query)))
+        return 0
+    if action == "show":
+        if not rest:
+            print("SysAI: Please provide a memory ID.", file=sys.stderr)
+            return 2
+        record = memory_mod.get(rest[0])
+        if not record:
+            print(f"SysAI: No memory with ID {rest[0]}.", file=sys.stderr)
+            return 1
+        _write(memory_mod.render_memory_list([record]))
+        return 0
+    if action == "forget":
+        if not rest:
+            print("SysAI: Please provide a memory ID.", file=sys.stderr)
+            return 2
+        removed = memory_mod.forget(rest[0])
+        print(f"SysAI: memory {rest[0]} " + ("deleted." if removed else "not found."))
+        return 0 if removed else 1
+    if action == "purge":
+        try:
+            approved = input(
+                "This will delete SysAI's persistent memories.\nContinue? [y/N] "
+            ).strip().lower() in ("y", "yes")
+        except (EOFError, KeyboardInterrupt):
+            approved = False
+        if not approved:
+            print("SysAI: memory purge cancelled.")
+            return 1
+        count = memory_mod.purge()
+        print(f"SysAI: {count} memory record(s) deleted.")
+        return 0
+    print(f"SysAI: unknown memory action: {action}", file=sys.stderr)
+    return 2
+
+
+def remember_command(text: str) -> int:
+    text = " ".join(str(text).split())
+    if not text:
+        print("SysAI: Please provide something to remember.", file=sys.stderr)
+        return 2
+    record = memory_mod.remember(text)
+    print(f"SysAI: remembered [{record['id']}] {record['statement']}")
+    return 0
+
+
+def feedback_command(args: list[str]) -> int:
+    if not args:
+        print("SysAI: Please provide feedback, e.g. `sysai feedback yes` or a short correction.",
+              file=sys.stderr)
+        return 2
+    if args == ["yes"]:
+        record = memory_mod.record_feedback("The previous SysAI assessment was confirmed correct.",
+                                             positive=True)
+    elif args == ["no"]:
+        record = memory_mod.record_feedback("The previous SysAI assessment was reported incorrect.",
+                                             positive=False)
+    else:
+        record = memory_mod.record_feedback(" ".join(args))
+    print(f"SysAI: recorded feedback [{record['id']}].")
+    return 0
+
+
+def context_command() -> int:
+    config = load_config()
+    session_response = _session_request("last_result")
+    session_active = _active_socket() is not None
+    entries, ignored = history_mod.relevant_history(
+        [], "system", mode=config.history_mode if config.history_enabled else history_mod.MODE_OFF,
+        lookback_hours=config.history_lookback_hours, max_entries=config.history_max_entries,
+        max_context_entries=config.history_max_context_entries)
+    mem_stats = memory_mod.stats()
+    lines = ["SysAI Context", "", "Session"]
+    lines.append(f"  {'active' if session_active else 'no active session'}")
+    if session_response.get("ok") and isinstance(session_response.get("result"), dict):
+        last = session_response["result"]
+        findings = last.get("findings", [])
+        lines.append(f"  Last diagnostic: {last.get('request', {}).get('command', 'unknown')}"
+                     f" ({len(findings)} finding(s))")
+    lines.append("")
+    lines.append("Relevant history")
+    lines.append(f"  {len(entries)} event(s), {ignored} ignored as unrelated")
+    lines.append("")
+    lines.append("Memory")
+    lines.append(f"  {mem_stats['total']} total")
+    for type_ in memory_mod.TYPES:
+        count = mem_stats["by_type"].get(type_, 0)
+        if count:
+            lines.append(f"    {type_}: {count}")
+    _write("\n".join(lines) + "\n")
+    return 0
+
+
 # Every word argparse owns. A reserved word is never re-interpreted as a raw
 # Command Insight command, so `sysai disk` is the disk diagnostic and not an
 # attempt to run a program called `disk`.
 RESERVED = {
     "explain", "investigate", "ask", "check", "health", "doctor", "what", "report",
     "baseline", "changes", "watch", "update", "thinking", "stop",
+    "history", "memories", "remember", "feedback", "context",
     *DOMAINS, "--help", "-h", "--version",
 }
 
@@ -548,6 +674,25 @@ def build_parser() -> argparse.ArgumentParser:
     thinking = sub.add_parser("thinking", help="control the live reasoning display")
     thinking.add_argument("state", choices=["on", "off", "status"])
     sub.add_parser("stop", help="stop an active SysAI session")
+
+    history_parser = sub.add_parser("history", help="SysAI's interpretation of recent relevant activity")
+    history_parser.add_argument("--all", action="store_true", dest="all_mode",
+                                help="show bounded sanitized recent history, not just relevant activity")
+    history_parser.add_argument("--json", action="store_true", dest="as_json",
+                                help="machine-readable output")
+
+    memory_parser = sub.add_parser("memories", help="local structured experience memory")
+    memory_parser.add_argument("action", nargs="?", default="list",
+                               choices=["list", "search", "show", "forget", "purge", "stats"])
+    memory_parser.add_argument("rest", nargs="*", help="query, ID, etc.")
+
+    remember_parser = sub.add_parser("remember", help="save an explicit local memory")
+    remember_parser.add_argument("text", nargs="+")
+
+    feedback_parser = sub.add_parser("feedback", help="confirm, reject, or correct the last assessment")
+    feedback_parser.add_argument("text", nargs="+")
+
+    sub.add_parser("context", help="what SysAI currently knows, without dumping data")
     return parser
 
 
@@ -605,6 +750,16 @@ def main(argv: list[str] | None = None) -> int:
         return thinking_command(args.state)
     if args.command == "stop":
         return stop_outside()
+    if args.command == "history":
+        return history_command(all_mode=args.all_mode, as_json=args.as_json)
+    if args.command == "memories":
+        return memory_command([args.action, *args.rest])
+    if args.command == "remember":
+        return remember_command(" ".join(args.text))
+    if args.command == "feedback":
+        return feedback_command(args.text)
+    if args.command == "context":
+        return context_command()
     if os.environ.get("SYSAI_SESSION"):
         parser.print_help()
         return 0

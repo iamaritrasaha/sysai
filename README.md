@@ -1,8 +1,12 @@
 # SysAI
 
-SysAI is a local AI-aware Bash session for Linux. It watches commands you run, notices failures, and uses a local Ollama model to explain what went wrong and suggest what to try next. **SysAI advises; it does not autonomously execute LLM-suggested commands.**
+SysAI is a local Linux intelligence and diagnostic companion.
 
-It is a terminal assistant, not a coding agent. Successful commands are recorded as lightweight, bounded context without invoking the model. Unexpected non-zero exits trigger concise local analysis.
+It runs alongside a real interactive Bash session, understands what is happening on your machine, and investigates problems through bounded, read-only diagnostics rather than guesswork. It correlates relevant recent Bash history with current evidence, remembers useful machine-specific experience locally, and turns all of that into evidence-based explanations and recommendations. **SysAI advises. It never autonomously applies repairs.**
+
+Processing is local by default. A configured local model (via Ollama) is the reasoning component underneath — an implementation detail, not the product. Web research is optional and off by default. Memory lives in a local database on your machine, not a cloud account. Successful commands are recorded as lightweight, bounded context without invoking the model; unexpected failures trigger concise local analysis.
+
+SysAI is not a coding agent, not an autonomous shell agent, and not a general-purpose chatbot. It does not replace Bash or automate your system — it understands it.
 
 ## Demo
 
@@ -34,6 +38,8 @@ The diagnostic is displayed for review. SysAI never runs it.
 
 ## Architecture
 
+At the terminal-integration level, SysAI supervises a real Bash session and turns its lifecycle into bounded, in-memory context:
+
 ```text
 Terminal emulator
       ↓
@@ -46,12 +52,37 @@ real interactive Bash               │
                                     ↓
                          redaction + safety prompt
                                     ↓
-                         local Ollama → configured model
-
-Explicit `ask --web` only → sanitized question → optional search provider
+                         configured local model
 ```
 
-SysAI writes a temporary, session-only rcfile and starts Bash with `bash --rcfile <temporary-file> -i`. That rcfile sources the user's normal `~/.bashrc` first and then SysAI's session-only monitoring hooks, and it is removed when the session ends. SysAI never modifies `~/.bashrc`, `~/.profile`, or `~/.bash_profile`, and never replaces Bash with a command parser.
+At the diagnostic level — every domain command, `check`, `changes`, `investigate`, `ask`, Command Insight, `watch`, and automatic failure analysis — SysAI combines three inputs before reasoning about anything:
+
+```text
+Current system evidence           deterministic, read-only diagnostics
+        +
+Relevant Bash history             bounded, relevance-scored, sanitized
+        +
+Prior local experience            bounded, sanitized memory
+        ↓
+Safe diagnostic engine            audited action IDs only, never argv
+        ↓
+Local reasoning                   configured local model
+        ↓
+Evidence-based assessment         labelled: current evidence vs. correlation vs. prior experience
+        ↓
+Human-reviewed recommendation     you decide whether to run it
+        ↓
+Confirmed outcomes become experience   (only from deterministic, confirmed findings, or explicit `sysai remember`/`feedback`)
+```
+
+Two distinctions matter throughout:
+
+- **History is not memory.** Bash history is recent operational context — what ran, roughly when, with what result. Memory is durable structured experience — machine facts, incidents, patterns, and corrections that persist across sessions. See [History intelligence](#history-intelligence) and [Experience memory](#experience-memory) below.
+- **Diagnostics are not repairs.** SysAI may autonomously collect validated read-only diagnostics through an audited action catalogue. It never autonomously applies a repair; every fix is a recommendation for you to review and run yourself.
+
+Explicit `--web` research is the one path that leaves the machine: a sanitized query only, never raw history, memory, logs, or terminal output.
+
+SysAI writes a temporary, session-only rcfile and starts Bash with `bash --rcfile <temporary-file> -i`. That rcfile sources your normal `~/.bashrc` first and then SysAI's session-only monitoring hooks, and it is removed when the session ends. SysAI never modifies `~/.bashrc`, `~/.profile`, or `~/.bash_profile`, and never replaces Bash with a command parser.
 
 ### Bash integration
 
@@ -65,16 +96,37 @@ Bash has no `preexec`/`precmd` hooks, so SysAI builds the equivalent lifecycle f
 
 ## Features
 
-- Real PTY-backed interactive Bash with prompts, colors, history, readline, completion, signals, sudo prompts, job control, and TUI support.
-- Automatic local analysis of unexpected non-zero command exits.
-- Deterministic read-only diagnostics for eight domains, a full-system summary, plain-language questions, sanitized reports, baselines, change analysis, command explanation, deeper failure investigation, and bounded monitoring.
-- `sysai doctor` for SysAI's own installation, model, and runtime health.
-- Explicit, optional `--web` research with sanitized queries only.
-- Common credential, authorization header, private-key, and secret-argument redaction, plus stricter identity sanitization for anything written to disk.
-- Bounded in-memory transcripts with head-and-tail truncation for large output.
-- Ownership-aware Ollama startup and shutdown; no boot-time service changes.
-- Conservative ANSI output and `NO_COLOR` support.
-- Standard-library-only Python implementation with no package dependencies.
+SysAI is organized around what it lets you do, not around any one command.
+
+### Understand your Linux system
+
+`health`, `doctor`, and one command per domain — `gpu`, `memory`, `disk`, `network`, `boot`, `services`, `packages`, `thermal` — each running deterministic, read-only collectors and explaining the result. Findings carry severity, confidence, evidence, and a suggested next diagnostic; nothing here mutates the system.
+
+### Investigate problems
+
+`explain` reasons about a command that just finished. `investigate` gathers additional safe evidence first, then explains. `check "why is my PC slow?"` routes a plain-language question to the right diagnostic. Command Insight (`sysai dmesg`, `sysai journalctl -b`, ...) inspects an explicitly named read-only command without dumping raw output. `watch` samples a domain for a bounded window. Optional, explicit `--web` research uses sanitized queries only.
+
+### Understand what changed
+
+`changes` parses package history, kernel/driver updates, reboots, and `/etc` modification times to answer "what changed before this started?" — correlated with relevant Bash history, always as correlation, never as claimed causation.
+
+### Remember machine experience
+
+`memories`, `remember`, `feedback`, and `context` give SysAI durable, local, structured memory of this machine — separate from Bash history and never sent anywhere.
+
+### Explain commands safely
+
+`what "sudo apt autoremove"` explains a command — program, arguments, privilege, risk, reversibility — **without ever executing it**.
+
+### Reports and baselines
+
+`report` renders sanitized Markdown or JSON evidence. `baseline` snapshots deterministic system facts and compares them later.
+
+### SysAI maintenance
+
+`doctor` diagnoses SysAI's own installation and runtime health. `update check`/`update` install only a checksum-verified release of SysAI itself — never the OS, never the model.
+
+Underneath all of this: a real PTY-backed interactive Bash with prompts, colors, readline, completion, signals, sudo prompts, job control, and TUI support; secret/credential redaction and stricter identity sanitization for anything written to disk; bounded in-memory transcripts; ownership-aware local-model startup and shutdown with no boot-time service changes; and a standard-library-only Python implementation with no package dependencies.
 
 **SysAI may autonomously collect ONLY validated read-only diagnostics. SysAI never autonomously applies repairs.**
 
@@ -82,7 +134,7 @@ Bash has no `preexec`/`precmd` hooks, so SysAI builds the equivalent lifecycle f
 
 | Command | What it does |
 | --- | --- |
-| `sysai` | Start the AI-aware Bash session |
+| `sysai` | Start the Bash session SysAI supervises |
 | `sysai explain` | Explain the most recently completed command |
 | `sysai investigate [--web]` | Gather more safe evidence about the last failure, then explain it |
 | `sysai ask [--web] QUESTION` | Ask a local Linux question |
@@ -98,9 +150,14 @@ Bash has no `preexec`/`precmd` hooks, so SysAI builds the equivalent lifecycle f
 | `sysai update check\|update` | Check for, or install, a checksum-verified SysAI release |
 | `sysai thinking on\|off\|status` | Control the live reasoning display |
 | `sysai stop` | Stop an active SysAI session |
+| `sysai history [--all] [--json]` | SysAI's interpretation of recent relevant activity |
+| `sysai memories list\|search\|show\|forget\|purge\|stats` | Local structured experience memory |
+| `sysai remember TEXT` | Save an explicit local memory |
+| `sysai feedback yes\|no\|TEXT` | Confirm, reject, or correct the last assessment |
+| `sysai context` | What SysAI currently knows, without dumping data |
 | `sysai <read-only command>` | Command Insight Mode (`sysai dmesg`, `sysai --raw journalctl -b`, `sysai sudo dmesg`) |
 
-Commands that display model prose (`health`, the domain commands, `check`, `changes`, `watch`, `investigate`, `report --last`) use the active SysAI session's local model. The deterministic evidence is collected and rendered either way; without a session, SysAI prints the facts and says the assessment is unavailable.
+Commands that display model prose (`health`, the domain commands, `check`, `changes`, `watch`, `investigate`, `report --last`) use the active SysAI session's local model. The deterministic evidence is collected and rendered either way; without a session, SysAI prints the facts and says the assessment is unavailable. Those same commands, plus `sysai ask` and Command Insight, are enriched with bounded, sanitized `history_correlation` and `prior_experience` sections before the model sees them — see [History intelligence](#history-intelligence) and [Experience memory](#experience-memory).
 
 ## Diagnostic architecture
 
@@ -109,7 +166,7 @@ deterministic collectors      fixed argv, no shell, bounded output
           ↓
 audited diagnostic engine     action IDs only, validated parameters, consent for elevated
           ↓
-local Qwen reasoning          explains evidence; never invents or executes commands
+local model reasoning         explains evidence; never invents or executes commands
           ↓
 manual repair recommendation  shown for you to run yourself
 ```
@@ -156,9 +213,34 @@ sysai --version
 sysai --help
 ```
 
+## Quick start
+
+```sh
+git clone https://github.com/iamaritrasaha/sysai.git
+cd sysai
+./install.sh
+sysai
+```
+
+From inside the session, or in a separate terminal once one is running:
+
+```sh
+sysai health                              # every diagnostic domain, summarized
+sysai gpu                                 # one domain in depth
+sysai check "why is my PC slow?"          # plain-language question, routed automatically
+sysai investigate                         # gather more evidence about the last failure
+sysai history                             # what SysAI thinks is relevant recent activity
+sysai memories                            # what SysAI remembers about this machine
+sysai baseline create                     # snapshot deterministic facts for later comparison
+sysai changes                             # what changed since the last boot
+sysai what "sudo apt autoremove"          # explain a command without running it
+```
+
+Nothing above requires any particular terminal emulator; SysAI works in any terminal that provides a PTY.
+
 ## Usage
 
-Start an AI-aware child Bash:
+Start the child Bash session SysAI supervises:
 
 ```sh
 sysai
@@ -431,11 +513,94 @@ web_enabled = false
 web_provider = "ollama"
 request_timeout_seconds = 120
 startup_timeout_seconds = 20
+history_enabled = true
+history_mode = "relevant"
+history_max_entries = 300
+history_lookback_hours = 48
+history_max_context_entries = 20
 ```
 
 Edit `~/.config/sysai/config.toml` and restart SysAI, or use `sysai thinking on|off` to toggle `thinking` without hand-editing the file. `thinking` controls both requesting reasoning tokens from Ollama and displaying the live "SysAI · thinking" box; there is no separate display-only flag, since requesting reasoning SysAI would then throw away is wasted latency. The model and API URL are configurable; no GPU name, username, or home path is embedded in the program.
 
+`history_mode` is one of `off`, `relevant` (default — only history that scores above a relevance threshold), `recent` (most recent, unranked), or `all` (used by `sysai history --all`). `history_max_entries` and `history_max_context_entries` are safety limits that apply in every mode, so a huge history file is never dumped to the model regardless of mode.
+
+## History intelligence
+
+SysAI does **not** blindly ingest your Bash history. Every diagnostic path that consults it goes through the same pipeline:
+
+```text
+Bash history
+      ↓
+local relevance filtering      domain vocabulary, recency, privilege, exit status
+      ↓
+privacy sanitization           secrets redacted, identity stripped
+      ↓
+bounded context                at most a handful of entries
+      ↓
+diagnosis
+```
+
+A relevant historical command may be correlated with current evidence — for example:
+
+```text
+sudo nala upgrade
+        ↓
+kernel/package change
+        ↓
+later GPU anomaly
+```
+
+SysAI may say *"this occurred shortly after…"* — a labelled `HISTORICAL / CORRELATION ONLY` observation. It must not say *"this caused…"* unless the evidence itself supports a direct mechanism. Ordering in time is never presented as proof.
+
+History that doesn't match the current diagnostic domain, or falls outside the lookback window, is simply not included — it is never dumped in bulk.
+
+```sh
+sysai history           # SysAI's interpretation of recent relevant activity
+sysai history --all     # bounded, sanitized recent activity, unranked
+sysai history --json    # the same, machine-readable
+```
+
+`sysai ask` and automatic failure analysis draw on the same pipeline, but only when the question or the failed command matches a recognizable diagnostic domain — a trivial question or an unrecognized program never triggers a lookup.
+
+## Experience memory
+
+This is **not** conversation history. It is structured, durable machine experience, kept separate from the recent-activity window above.
+
+Memory holds a handful of record types:
+
+- **machine facts** — e.g. "the primary GPU is an AMD Radeon RX 7600"
+- **incidents** — a confirmed diagnostic finding, recorded automatically
+- **recurring patterns**
+- **outcomes**
+- **user corrections** — via `sysai feedback`
+- **preferences**
+- **diagnostic lessons** — e.g. a prior suspicion that telemetry later ruled out
+
+Guarantees:
+
+- stored locally only, in a small SQLite database — never a cloud account
+- bounded: at most a handful of memories are retrieved for any one diagnosis, always labelled `PRIOR EXPERIENCE`
+- sanitized: every stored string is redacted and privacy-sanitized before it is written
+- inspectable and forgettable, on request
+- never sent to web search, under any circumstance
+
+```sh
+sysai memories                        # list what's stored
+sysai memories search "GPU"           # search stored memories
+sysai remember "My main GPU is an AMD Radeon RX 7600."
+sysai feedback "The HDMI cable was the actual problem."
+sysai context                         # what SysAI currently knows, without dumping data
+sysai memories forget <id>            # remove one memory
+sysai memories purge                  # confirmation-gated: remove everything
+```
+
+Automatic memory writes happen only from a `CONFIRMED` `critical`/`warning` finding that Python's own collectors computed — never from free-form model text — and a repeated finding reinforces the existing memory rather than duplicating it. SysAI learns by accumulating this structured local evidence over time; the underlying model itself is never retrained. The memory interface is designed so another local backend could be added later, but none is required today.
+
+See the **History intelligence** and **Memory** sections of [SECURITY.md](SECURITY.md) for the full guarantees.
+
 ## Privacy and security model
+
+SysAI is local-first: there is no cloud memory requirement, and raw Bash history is never blindly sent to the model. Three kinds of context stay clearly separated — local on-screen context (bounded process memory, gone when the session ends), persisted memory (a local database, never leaves the machine), and web research (opt-in, sanitized, and the only path that talks to an external service).
 
 - Model output — including reasoning ("thinking") text — is display-only and control characters are removed before display. It is never parsed as a command, never passed to a shell, and can never become terminal input.
 - Fixed executable argv is used to start Bash and Ollama; observed command text is data, never interpolated for execution. Bash is resolved to `/bin/bash`, or to `bash` on `PATH`; the user's arbitrary `$SHELL` is never launched, and SysAI never uses `bash -c`, `eval`, or a shell interpreter for observed or model-generated text.
@@ -443,7 +608,8 @@ Edit `~/.config/sysai/config.toml` and restart SysAI, or use `sysai thinking on|
 - Recent command/output context and reasoning text exist only in bounded process memory. Reasoning is never persisted to disk and is never added to SysAI's short-lived conversation context; only final answers are kept there, and only for explicit `sysai ask` follow-ups.
 - Runtime sockets and ownership state live in a mode-`0700`, user-owned runtime directory; state is mode `0600` and written atomically. `~/.config/sysai/config.toml` is written mode `0600`.
 - PTY output and hook events travel over separate file descriptors, preventing ordinary terminal output from becoming internal protocol data.
-- Web search is disabled by default and never receives a raw terminal transcript or model reasoning text — only an explicit, sanitized user question.
+- Web search is disabled by default and never receives a raw terminal transcript or model reasoning text — only an explicit, sanitized user question. Bash history and stored memory are never sent to web search, in any form, sanitized or not.
+- Memory is local structured state, never conversation history. Nothing in the memory or history pipeline can execute a command: a stored memory or a history entry is inert data, never argv, never shell input, never an action ID.
 - Health diagnostics use an audited fixed read-only allowlist with bounded timeouts; model suggestions, including repairs, are never executed.
 - One canonical sanitization layer serves every structured diagnostic. On-screen local output removes secrets; anything written to disk or sent to a search provider additionally removes usernames, home paths, hostnames, IP and MAC addresses, serial numbers, and UUIDs.
 - Findings are computed in Python. The model explains evidence; it never derives a deterministic fact, contributes a finding, or supplies an executable command. Diagnostic action IDs are validated against a fixed argv table, and their parameters must come from a collector.
@@ -451,13 +617,13 @@ Edit `~/.config/sysai/config.toml` and restart SysAI, or use `sysai thinking on|
 - Self-update installs only a release whose artifact matches a published checksum manifest. It never pulls a branch, never pipes a download into a shell, and never updates a development checkout in place.
 - `sysai watch` is foreground and bounded. There is no daemon, background service, timer, or startup unit, and samples are discarded once the summary is produced.
 - Secret redaction is defense in depth, not a guarantee. Avoid printing secrets and revoke any credential that may have appeared in a terminal.
-- Qwen can be mistaken, in its reasoning as well as its final answer. Review every suggested command, especially commands involving `sudo`, deletion, permissions, disks, packages, services, boot, `/etc`, or networking.
+- The local model can be mistaken, in its reasoning as well as its final answer. Review every suggested command, especially commands involving `sudo`, deletion, permissions, disks, packages, services, boot, `/etc`, or networking.
 
 See [`SECURITY.md`](SECURITY.md) for vulnerability reporting.
 
 ## What SysAI keeps
 
-SysAI is memory-only by default. Recent command context, captured output, diagnostic evidence, model reasoning, and watch samples exist only in bounded process memory and disappear when the session ends. Nothing writes a shell-history copy, a command transcript, reasoning text, raw health logs, or retained telemetry.
+SysAI is otherwise memory-only by default. Recent command context, captured output, model reasoning, and watch samples exist only in bounded process memory and disappear when the session ends. Nothing writes a shell-history copy, a command transcript, reasoning text, raw health logs, or retained telemetry.
 
 Only these files are ever written, and only for the reasons given:
 
@@ -466,6 +632,7 @@ Only these files are ever written, and only for the reasons given:
 | `~/.config/sysai/config.toml` | installer, `sysai thinking on\|off` | settings, mode `0600` |
 | `~/.config/sysai/env` | you | the optional web-search key, mode `0600` |
 | `$XDG_STATE_HOME/sysai/baseline.json` | `sysai baseline create` | sanitized deterministic facts, mode `0600`, atomic |
+| `$XDG_STATE_HOME/sysai/memory.db` | diagnostics, `sysai remember`, `sysai feedback` | sanitized structured memory (facts, incidents, corrections — never raw logs), mode `0600` |
 | the path you pass to `--output` | `sysai report --output PATH` | a sanitized report, mode `0600`, atomic |
 | `$XDG_RUNTIME_DIR/sysai/` | an active session | control socket and ownership state, mode `0700`/`0600` |
 
@@ -518,6 +685,10 @@ Confirm `web_enabled = true` and that `~/.config/sysai/env` contains a valid `OL
 - `sysai changes` reads package and boot history, not arbitrary file contents, so a change made outside a package manager and outside `/etc` is not visible to it.
 - Automatic self-update requires the release to publish a checksum manifest. Until one exists, `sysai update` reports that and gives manual instructions.
 - Linux is currently required. macOS, BSD, and Windows are not supported in v0.1.0.
+- History correlation and memory retrieval apply to `health`, the domain commands, `check`, `changes`, `investigate`, `baseline compare`, `watch`, `sysai ask`, Command Insight Mode, and automatic failure analysis. `sysai ask` and automatic failure analysis only query them when the question or the failed command matches a recognizable diagnostic domain — a trivial question ("what is a symlink") or an unrecognized program never triggers a lookup.
+- Bash history without `HISTTIMEFORMAT` set has no per-command timestamp; those entries are scored and shown with an honest "unknown time" rather than an invented one.
+- Automatic incident memory is written only from a `CONFIRMED` `critical`/`warning` finding; a `POSSIBLE`/`PROBABLE` finding is never auto-recorded, only explicit `sysai remember`/`sysai feedback`.
+- `sysai memories` is the experience-memory command; `sysai memory` is the RAM diagnostic domain. The names differ deliberately to avoid ambiguity.
 
 ## Development and testing
 

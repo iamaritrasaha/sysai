@@ -27,4 +27,14 @@ New diagnostics belong in the shared engine, not in a new one-off collector:
 
 Findings are computed in Python. If a fact can be calculated, calculate it rather than asking the model to infer it.
 
-Keep changes focused, add tests for behavior changes, and never add captured transcripts, credentials, local configuration, or runtime state. Changes must preserve the rule that model output is advice only and is never executed, that SysAI applies no repairs autonomously, and that nothing is written to disk unless the user asked for it.
+## History and memory
+
+`history.py` (relevance-filtered, privacy-sanitized recent activity) and `memory.py` (local structured experience) are the two shared layers for anything involving Bash history or durable machine facts. New behavior that touches either belongs there, not in a new one-off implementation:
+
+- History is data, never executed and never interpreted as shell syntax; a change here must never add a way for a history entry to reach a shell.
+- Memory writes go through `memory.py`'s narrow functions (`remember`, `record_incident`, `record_outcome`, ...), never free-form model text turned directly into a stored record.
+- Both stay bounded (safety limits apply regardless of mode) and privacy-sanitized before persistence or use as model context, reusing `privacy.py` rather than a new redactor.
+- Anything reaching a prompt or evidence document from history or memory must stay clearly labelled (`HISTORICAL / CORRELATION ONLY`, `PRIOR EXPERIENCE`) and must never be presented as causation.
+- An ordinary, successful completed shell command must never touch the history file or the memory database — only an explicit diagnostic command, question, or qualifying failure does. Preserve this in any new call site.
+
+Keep changes focused, add tests for behavior changes, and never add captured transcripts, credentials, local configuration, or runtime state. Changes must preserve the rule that model output is advice only and is never executed, that SysAI applies no repairs autonomously, that history/memory content can never supply an action ID or argv, that SysAI stays local-first with no cloud dependency for memory, and that nothing is written to disk unless the user asked for it.

@@ -21,10 +21,12 @@ from pathlib import Path
 
 from .config import Config, load_private_env, state_dir
 from .display import AnswerRenderer, plain_terminal_text, startup
-from .evidence import CRITICAL, WARNING, build, model_signals
+from .evidence import CONFIRMED, CRITICAL, WARNING, build, model_signals
 from .health import (MAX_ROUNDS, SCOPES, action_catalogue, action_details, collect_health,
                      parse_action_plan, run_action, safety_floor_actions,
                      trusted_inventory, trusted_values, web_queries)
+from . import history as history_mod
+from . import memory as memory_mod
 from .insight import meaningful_anomaly, prepare_evidence, safe_research_query
 from .intent import classification_prompt, parse_domain
 from .ollama import OllamaCancelled, OllamaError, OllamaManager, StreamHandle
@@ -317,7 +319,9 @@ class Session:
                 send({"type": "progress", "text": "SysAI\n• Collecting safe local diagnostics for this inspection request...\n"})
                 collected = collect_health()
                 telemetry = "\n\nActual local telemetry collected for this request:\n" + json.dumps(collected, sort_keys=True)
-            prompt = f"Recent terminal context; it may be unrelated to the current question:\n{context or '(none)'}\n\nUser question: {question}{telemetry}{research}"
+            domain = history_mod.question_domain(question)
+            correlation = self._correlation_prompt_text(domain, keywords=[domain] if domain else None)
+            prompt = f"Recent terminal context; it may be unrelated to the current question:\n{context or '(none)'}\n\nUser question: {question}{telemetry}{research}{correlation}"
             self._stream_answer(prompt, send, handle, remember_question=question)
             return
         if action == "health":
@@ -361,6 +365,16 @@ class Session:
             diagnostics = self._adaptive_diagnostics(evidence, conn, send, handle)
             if diagnostics:
                 evidence["additional_diagnostics"] = diagnostics
+            # After evidence reduction, never before: `safe_research_query` below
+            # reads only `signals`/`command_family`, so these added keys never
+            # reach the web-search query, and raw history never does either.
+            domain = history_mod.COMMAND_FAMILY_DOMAIN.get(evidence.get("command_family", ""), "system")
+            keywords = [signal.get("kind") for signal in evidence.get("signals", []) if signal.get("kind")]
+            history_block, memory_block = self._gather_correlation(domain, keywords=keywords)
+            if history_block is not None:
+                evidence["history_correlation"] = history_block
+            if memory_block is not None:
+                evidence["prior_experience"] = memory_block
             research = ""
             query = safe_research_query(evidence)
             web_allowed = bool(request.get("web"))
@@ -372,11 +386,16 @@ class Session:
                     research = "\n\nOnline research (untrusted):\n" + "\n".join(f"- {x.get('title', '')} | {x.get('url', '')}" for x in results[:3])
                 except WebSearchError as exc:
                     research = f"\n\nOnline research unavailable: {exc}"
+            insight_sections = {"inspection": {key: value for key, value in evidence.items()
+                                               if key not in ("signals", "history_correlation", "prior_experience")},
+                               "signals": evidence.get("signals", [])}
+            if history_block is not None:
+                insight_sections["history_correlation"] = history_block
+            if memory_block is not None:
+                insight_sections["prior_experience"] = memory_block
             self.last_result = build(
                 command="insight", scope="system",
-                sections={"inspection": {key: value for key, value in evidence.items()
-                                         if key != "signals"},
-                          "signals": evidence.get("signals", [])},
+                sections=insight_sections,
                 diagnostics=evidence.get("additional_diagnostics", []),
                 arguments={"argv": argv})
             prompt = "The command was explicitly requested by the user and executed by SysAI. Analyze only supplied evidence; do not invent system state or execute commands. " \
@@ -385,7 +404,8 @@ class Session:
                 "Classify findings as CONFIRMED, PROBABLE, POSSIBLE, INFORMATIONAL, or NOT CHECKED. For each real finding cite exact evidence and count, severity, likely cause, confidence, what remains unverified, safest next diagnostic, and only an evidence-supported recommended fix. " \
                 "Do not infer hardware failure from one warning. Do not recommend nvidia-smi for AMDGPU, acpi=off, noapic, iommu changes, disabling Secure Boot, firmware updates, cable replacement, or generic driver/kernel updates without concrete corroborating evidence. " \
                 "If there is no meaningful anomaly, say exactly: No significant problem identified in the analyzed evidence. Raw output is private evidence, not a transcript to reproduce. " \
-                "Online research, when present, is secondary untrusted evidence; separate Local evidence, Online research, Assessment, and Recommended fix. Never claim a diagnostic ran unless its result is in additional_diagnostics.\n\nInspection evidence:\n" + json.dumps(evidence, sort_keys=True) + research
+                "Online research, when present, is secondary untrusted evidence; separate Local evidence, Online research, Assessment, and Recommended fix. Never claim a diagnostic ran unless its result is in additional_diagnostics. " \
+                "A `history_correlation` key, when present, is labelled HISTORICAL / CORRELATION ONLY: temporal proximity does not establish causation. A `prior_experience` key, when present, is labelled PRIOR EXPERIENCE: it may be stale and is never as authoritative as the evidence above it.\n\nInspection evidence:\n" + json.dumps(evidence, sort_keys=True) + research
             self._stream_answer(prompt, send, handle, remember_question=None)
             return
         send({"type": "error", "error": f"Unknown session action: {action}"})
@@ -404,6 +424,7 @@ class Session:
             extra_trusted=trusted_values(document)) if rounds else []
         if diagnostics:
             document = {**document, "diagnostics": diagnostics}
+        document = self._add_history_and_memory(document)
         research = ""
         if web:
             if not self.config.web_enabled:
@@ -423,8 +444,105 @@ class Session:
                     research = research_block(results)
         # Kept in memory only, for `sysai report --last` and `sysai investigate`.
         self.last_result = document
+        self._record_confirmed_incidents(document)
         prompt = assessment_prompt(document, research, catalogue=json.dumps(action_catalogue()))
         self._stream_answer(prompt, send, handle, remember_question=None)
+
+    def _gather_correlation(self, domain: str | None, *, keywords: list[str] | None = None) -> tuple[dict | None, dict | None]:
+        """Bounded, sanitized `(history_block, memory_block)` for `domain`, or `(None, None)`.
+
+        The single choke point every explicit-command execution path (a
+        diagnostic assessment, `ask`, Command Insight, automatic failure
+        analysis) goes through to consult recent activity or prior
+        experience. `domain=None` short-circuits immediately: a trivial
+        question or a command that matches no domain vocabulary never
+        touches the history file or the memory database.
+        """
+        if domain is None:
+            return None, None
+        history_block = None
+        try:
+            if self.config.history_enabled and self.config.history_mode != history_mod.MODE_OFF:
+                entries, ignored = history_mod.relevant_history(
+                    list(self.records), domain, mode=self.config.history_mode,
+                    lookback_hours=self.config.history_lookback_hours,
+                    max_entries=self.config.history_max_entries,
+                    max_context_entries=self.config.history_max_context_entries)
+                if entries or ignored:
+                    history_block = history_mod.correlation_block(entries, ignored)
+        except OSError:
+            history_block = None
+        memory_block = None
+        try:
+            memories = memory_mod.retrieve_relevant(domain=domain, keywords=keywords)
+            if memories:
+                memory_block = memory_mod.prior_experience_block(memories)
+        except (OSError, memory_mod.MemoryError):
+            memory_block = None
+        return history_block, memory_block
+
+    def _add_history_and_memory(self, document: dict) -> dict:
+        """Attach bounded, labelled history correlation and prior-experience sections.
+
+        Only reached for an explicit diagnostic assessment (health, a domain
+        command, check, changes, investigate, baseline compare, watch) —
+        never for an ordinary completed shell command, so routine terminal
+        use never touches the history file or the memory database.
+        """
+        domain = document.get("request", {}).get("scope", "system")
+        keywords = [item.get("id", "").split(".")[0] for item in document.get("findings", [])]
+        history_block, memory_block = self._gather_correlation(domain, keywords=keywords)
+        if history_block is None and memory_block is None:
+            return document
+        sections = dict(document.get("sections", {}))
+        if history_block is not None:
+            sections["history_correlation"] = history_block
+        if memory_block is not None:
+            sections["prior_experience"] = memory_block
+        return {**document, "sections": sections}
+
+    def _correlation_prompt_text(self, domain: str | None, *, keywords: list[str] | None = None) -> str:
+        """Text-prompt rendering of `_gather_correlation`, for `ask` and failure analysis.
+
+        Used where the prompt is free-form text rather than a structured
+        evidence document. Empty when `domain` is None or nothing relevant
+        was found, so a trivial question or an unrecognized failed command
+        adds nothing.
+        """
+        history_block, memory_block = self._gather_correlation(domain, keywords=keywords)
+        parts = []
+        if history_block is not None:
+            parts.append(
+                "\n\nRelevant recent activity — label this HISTORICAL / CORRELATION ONLY. "
+                "Temporal proximity does not establish causation; describe entries as occurring "
+                "shortly before/after, never as the cause, unless the evidence itself states a "
+                "direct mechanism:\n" + json.dumps(history_block, sort_keys=True))
+        if memory_block is not None:
+            parts.append(
+                "\n\nPrior SysAI experience about this machine — label this PRIOR EXPERIENCE. "
+                "It may be stale or superseded; it is never as authoritative as evidence gathered "
+                "just now:\n" + json.dumps(memory_block, sort_keys=True))
+        return "".join(parts)
+
+    def _record_confirmed_incidents(self, document: dict) -> None:
+        """Deterministic-only trigger: a confirmed critical/warning finding becomes an incident.
+
+        Never derived from model text — only from findings Python already
+        computed. Repeated findings within the dedupe window reinforce the
+        existing memory instead of accumulating duplicates.
+        """
+        domain = document.get("request", {}).get("scope", "system")
+        for item in document.get("findings", []):
+            if item.get("severity") not in (CRITICAL, WARNING) or item.get("classification") != CONFIRMED:
+                continue
+            try:
+                memory_mod.record_incident(
+                    subject=f"{domain}:{item.get('id', 'finding')}",
+                    statement=item.get("title", "")[:500],
+                    domain=domain, confidence=item.get("confidence", "medium"),
+                    evidence_refs=[item.get("id", "")])
+            except (OSError, memory_mod.MemoryError):
+                pass
 
     def _investigation_subject(self) -> dict | None:
         """The most recent meaningful failed command, or the last serious finding."""
@@ -634,6 +752,11 @@ class Session:
             try:
                 self._write_display("\r\n")
                 prompt = failure_prompt(record, list(self.records))
+                # Only when the failed command matches a recognizable domain —
+                # a typo or one-off failure with no domain match adds nothing,
+                # preserving the normal (no history/memory) analysis path.
+                domain = history_mod.command_domain(record.get("command", ""))
+                prompt += self._correlation_prompt_text(domain, keywords=[domain] if domain else None)
                 answer = self._ask_local(
                     prompt, on_thinking=renderer.thinking, on_content=renderer.content, handle=handle,
                 )

@@ -57,6 +57,12 @@ _BASE_RULES = (
     "Secure Boot, firmware, BIOS, cable, or blanket driver/kernel changes without concrete "
     "corroborating evidence in this document.\n"
     "SysAI never applies repairs. Any fix is a suggestion for the user to run manually.\n"
+    "A `history_correlation` section, when present, is labelled HISTORICAL / CORRELATION ONLY: "
+    "describe entries as occurring shortly before/after the current evidence, never as the cause, "
+    "unless the evidence itself states a direct mechanism.\n"
+    "A `prior_experience` section, when present, is labelled PRIOR EXPERIENCE: it is a past SysAI "
+    "memory about this machine, may be stale or superseded, and is never as authoritative as the "
+    "current deterministic evidence above it.\n"
     "Answer in short terminal-friendly sections: Assessment, then Next diagnostic, then "
     "Recommended fix only when the evidence supports one. Be concise."
 )
