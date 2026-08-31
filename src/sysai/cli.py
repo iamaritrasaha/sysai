@@ -194,7 +194,7 @@ def _print_response(response: dict) -> int:
 def stop_outside() -> int:
     response = _session_request("stop")
     if response.get("ok"):
-        print("SysAI stopped.\nQwen unloaded; SysAI-owned Ollama will shut down.\nGoodbye 👋")
+        print("SysAI stopping. The local model will unload; SysAI-owned Ollama will shut down.")
         return 0
     # Recover state left behind by an abnormally terminated SysAI process.
     state_path = state_dir() / "active.json"

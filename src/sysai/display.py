@@ -37,13 +37,176 @@ def box(message: str, title: str = "SysAI") -> str:
     return "\n".join(lines) + "\n"
 
 
-def startup(model: str) -> str:
-    color = not os.environ.get("NO_COLOR") and os.isatty(1)
-    green, bold, reset = ("\033[32m", "\033[1m", "\033[0m") if color else ("", "", "")
-    return (
-        f"{bold}SysAI{reset}\nLocal Linux assistant\n{model} • Ollama\n\n"
-        f"{green}✓{reset} Ollama ready\n{green}✓{reset} Terminal monitoring active\n\n"
+# The SYSAI wordmark, hand-drawn on a 5x7 dot-matrix grid so every row is
+# provably the same width (see `tests/test_display.py`). Two sizes only:
+# a terminal either fits the wide mark, the medium one, or falls back to
+# plain text — there is no intermediate scaling.
+_WORDMARK_WIDE = (
+    "  ████████  ██      ██    ████████      ██      ██████████",
+    "██          ██      ██  ██            ██  ██        ██    ",
+    "██            ██  ██    ██          ██      ██      ██    ",
+    "  ██████        ██        ██████    ██      ██      ██    ",
+    "        ██      ██              ██  ██████████      ██    ",
+    "        ██      ██              ██  ██      ██      ██    ",
+    "████████        ██      ████████    ██      ██  ██████████",
+)
+_WORDMARK_MEDIUM = (
+    " ████ █   █  ████   █   █████",
+    "█     █   █ █      █ █    █  ",
+    "█      █ █  █     █   █   █  ",
+    " ███    █    ███  █   █   █  ",
+    "    █   █       █ █████   █  ",
+    "    █   █       █ █   █   █  ",
+    "████    █   ████  █   █ █████",
+)
+_WORDMARK_NARROW = "S Y S A I"
+
+# Terminal-width bands the banners adapt to. A terminal narrower than the
+# widest of these still gets *something* on-brand: `_wordmark_for` and the
+# line-fitting helpers below always degrade gracefully rather than wrap or
+# overflow.
+WIDE_MIN_COLUMNS = 70
+MEDIUM_MIN_COLUMNS = 50
+
+_TAGLINE = "Bash  •  Diagnostics  •  Memory  •  Experience"
+_SUBTITLE = "Local Linux Intelligence"
+
+
+def _columns(width: int | None) -> int:
+    if width is not None:
+        return max(1, width)
+    return shutil.get_terminal_size(fallback=(80, 24)).columns
+
+
+def _use_color() -> bool:
+    return not os.environ.get("NO_COLOR") and os.isatty(1)
+
+
+def _center(line: str, columns: int) -> str:
+    if len(line) >= columns:
+        return line
+    return " " * ((columns - len(line)) // 2) + line
+
+
+def _fit(line: str, columns: int) -> str | None:
+    """`line` centered, or None when it cannot fit without overflowing."""
+    return _center(line, columns) if len(line) <= columns else None
+
+
+def _status(ok: bool, label: str, short_label: str, columns: int, *, color_on: str, reset: str) -> str:
+    """A `✓/✗ label` status line, guaranteed to never exceed `columns`.
+
+    Sized against the plain (uncolored) text so ANSI escape bytes never
+    count toward the visible width. Falls back to a shorter label before
+    ever truncating raw text, so a genuinely tiny terminal still gets a
+    readable (if abbreviated) status rather than a mid-word cut.
+    """
+    symbol = "✓" if ok else "✗"
+    plain = f"{symbol} {label}"
+    if len(plain) > columns:
+        plain = f"{symbol} {short_label}"
+    plain = plain[:columns]
+    return f"{color_on}{plain[0]}{reset}{plain[1:]}" if color_on else plain
+
+
+def _wordmark_lines(columns: int, *, bold: str = "", reset: str = "") -> list[str]:
+    """The best-fitting wordmark tier for `columns`, each line bolded and centered.
+
+    Always returns *something*: even a terminal narrower than the plain
+    "S Y S A I" fallback gets a truncated-but-safe single line rather than
+    an empty banner or an overflow.
+    """
+    if columns >= WIDE_MIN_COLUMNS and len(_WORDMARK_WIDE[0]) <= columns:
+        art = _WORDMARK_WIDE
+    elif columns >= MEDIUM_MIN_COLUMNS and len(_WORDMARK_MEDIUM[0]) <= columns:
+        art = _WORDMARK_MEDIUM
+    elif len(_WORDMARK_NARROW) <= columns:
+        art = (_WORDMARK_NARROW,)
+    else:
+        art = ("SYSAI"[:columns],)
+    return [f"{bold}{_center(line, columns)}{reset}" for line in art]
+
+
+def startup_banner(
+    model: str,
+    *,
+    ollama_ready: bool = True,
+    bash_monitoring: bool = True,
+    width: int | None = None,
+) -> str:
+    """The SysAI welcome screen: wordmark, identity, then runtime status.
+
+    Adapts to the terminal width (wide/medium/narrow), stays legible with
+    `NO_COLOR` or a non-tty stdout, and only shows status lines that are
+    actually true — a status that failed to come up is never silently
+    reported as ready.
+    """
+    columns = _columns(width)
+    color = _use_color()
+    bold, dim, green, red, reset = (
+        ("\033[1m", "\033[2m", "\033[32m", "\033[31m", "\033[0m") if color else ("", "", "", "", "")
     )
+    lines = [""]
+    lines.extend(_wordmark_lines(columns, bold=bold, reset=reset))
+    lines.append("")
+    for text in (_SUBTITLE, _TAGLINE):
+        fitted = _fit(text, columns)
+        if fitted is not None:
+            lines.append(f"{dim}{fitted}{reset}" if color else fitted)
+    lines.append("")
+    lines.append(_status(ollama_ready, "Ollama ready" if ollama_ready else "Ollama unavailable",
+                        "Ollama ready" if ollama_ready else "Ollama down", columns,
+                        color_on=(green if ollama_ready else red), reset=reset))
+    lines.append(_status(bash_monitoring, "Bash monitoring active" if bash_monitoring else "Bash monitoring inactive",
+                        "Bash monitor active" if bash_monitoring else "Bash monitor off", columns,
+                        color_on=(green if bash_monitoring else red), reset=reset))
+    model_line = _fit(f"model: {model}", columns)
+    if model_line is not None:
+        lines.append(f"{dim}{model_line}{reset}" if color else model_line)
+    lines.append("")
+    return "\n".join(lines) + "\n"
+
+
+def goodbye_banner(
+    *,
+    reason: str = "normal",
+    model_unloaded: bool = True,
+    session_closed: bool = True,
+    width: int | None = None,
+) -> str:
+    """The SysAI farewell screen. Callable exactly once per session exit.
+
+    `reason="normal"` is the only polished, celebratory form — it is meant
+    for `sysai stop`, Ctrl+D/EOF, and `exit`, once the child Bash has
+    actually finished. Any other reason (an unexpected shutdown, a crash)
+    renders a short, plain, non-celebratory line instead: this function
+    never claims a clean close it cannot back up.
+    """
+    columns = _columns(width)
+    color = _use_color()
+    bold, dim, green, reset = (
+        ("\033[1m", "\033[2m", "\033[32m", "\033[0m") if color else ("", "", "", "")
+    )
+    if reason != "normal":
+        text = "SysAI session ended unexpectedly."[:columns]
+        return f"{dim}{text}{reset}\n" if color else f"{text}\n"
+    lines = [""]
+    lines.extend(_wordmark_lines(columns, bold=bold, reset=reset))
+    lines.append("")
+    fitted = _fit("Session complete.", columns)
+    if fitted is not None:
+        lines.append(fitted)
+    lines.append("")
+    if model_unloaded:
+        lines.append(_status(True, "Local model unloaded", "Model unloaded", columns, color_on=green, reset=reset))
+    if session_closed:
+        lines.append(_status(True, "Session closed", "Session closed", columns, color_on=green, reset=reset))
+    lines.append("")
+    farewell = _fit("Until next time. ── SysAI", columns)
+    if farewell is not None:
+        lines.append(f"{dim}{farewell}{reset}" if color else farewell)
+    lines.append("")
+    return "\n".join(lines) + "\n"
 
 
 class StreamBox:

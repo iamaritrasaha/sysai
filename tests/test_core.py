@@ -141,11 +141,40 @@ class CoreTests(unittest.TestCase):
         kill.assert_called_once_with(12345, 1)
 
     def test_in_session_stop_is_graceful(self):
+        # The visible goodbye banner is printed once, from `run()`, after
+        # Bash actually exits — not from this response, which stays silent
+        # so the bash wrapper's `builtin exit 0` doesn't print it twice.
         session = Session(Config(), "/bin/true")
         response = session._control({"action": "leave"})
         self.assertTrue(response["ok"])
-        self.assertIn("Goodbye", response["message"])
+        self.assertEqual(response["message"], "")
         self.assertFalse(session.stop_requested.is_set())
+
+    def test_run_prints_the_welcome_banner_once_and_the_goodbye_once_after_the_child_exits(self):
+        session = Session(Config(), "/bin/true")
+        written = []
+        order = []
+
+        def fake_relay(*args, **kwargs):
+            order.append("relay")
+            return 0
+
+        with mock.patch("os.isatty", return_value=True), \
+             mock.patch.object(session, "_acquire_session_lock"), \
+             mock.patch.object(session.ollama, "ensure_ready"), \
+             mock.patch("sysai.session._safe_write", side_effect=lambda fd, data: written.append(data)), \
+             mock.patch("sysai.session.bash_executable", return_value="/bin/true"), \
+             mock.patch("sysai.session.write_session_rcfile"), \
+             mock.patch("sysai.session.pty.fork", return_value=(999, 5)), \
+             mock.patch("os.close"), \
+             mock.patch.object(session, "_start_control_server"), \
+             mock.patch.object(session, "_write_state"), \
+             mock.patch.object(session, "_relay", side_effect=fake_relay):
+            session.run()
+        self.assertEqual(order, ["relay"])
+        self.assertEqual(len(written), 2)
+        self.assertIn(b"Local Linux Intelligence", written[0])
+        self.assertIn(b"Session complete.", written[1])
 
     def test_large_output_keeps_head_and_tail(self):
         text = "HEAD" + "x" * 10000 + "TAIL"

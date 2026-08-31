@@ -20,7 +20,7 @@ import threading
 from pathlib import Path
 
 from .config import Config, load_private_env, state_dir
-from .display import AnswerRenderer, plain_terminal_text, startup
+from .display import AnswerRenderer, goodbye_banner, plain_terminal_text, startup_banner
 from .evidence import CONFIRMED, CRITICAL, WARNING, build, model_signals
 from .health import (MAX_ROUNDS, SCOPES, action_catalogue, action_details, collect_health,
                      parse_action_plan, run_action, safety_floor_actions,
@@ -230,11 +230,12 @@ class Session:
     def _control(self, request: dict) -> dict:
         action = request.get("action")
         if action == "leave":
-            # The in-session Bash function exits itself after receiving this reply.
-            return {
-                "ok": True,
-                "message": "SysAI stopped.\nQwen unloaded; SysAI-owned Ollama shut down when applicable.\nGoodbye 👋",
-            }
+            # The in-session Bash function exits itself after receiving this
+            # reply. No goodbye text here: once Bash actually exits, `run`
+            # prints the one, single goodbye banner for every normal-exit
+            # path (this one included), so this response stays silent to
+            # avoid printing it twice.
+            return {"ok": True, "message": ""}
         if action == "stop":
             self.stop_requested.set()
             if self.child_pid:
@@ -807,7 +808,7 @@ class Session:
             raise RuntimeError("`sysai` must be started from an interactive terminal.")
         self._acquire_session_lock()
         self.ollama.ensure_ready(self.runtime)
-        _safe_write(1, startup(self.config.model).encode())
+        _safe_write(1, startup_banner(self.config.model).encode())
         event_r, event_w = os.pipe()
         response_r, response_w = os.pipe()
         for fd in (event_w, response_r):
@@ -837,6 +838,12 @@ class Session:
             self._start_control_server()
             self._write_state()
             status = self._relay(pid, master, event_r, response_w)
+        # `_relay` only returns once the child Bash has actually exited —
+        # via `sysai stop`, Ctrl+D/EOF, or `exit` — so this is the single
+        # place a normal-exit goodbye is printed, whichever path led here.
+        # A crash or an unexpected termination propagates as an exception
+        # instead of reaching this line, so it never gets this banner.
+        _safe_write(1, goodbye_banner().encode())
         return status
 
     def _relay(self, pid: int, master: int, event_r: int, response_w: int) -> int:
