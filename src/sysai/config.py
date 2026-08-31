@@ -3,8 +3,9 @@ from __future__ import annotations
 import os
 import re
 import stat
+import tempfile
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from pathlib import Path
 
 
@@ -16,6 +17,7 @@ class Config:
     model_endpoint: str = ""
     api_key_env: str = "SYSAI_API_KEY"
     remote_consent: bool = False
+    active_model_id: str = ""
     auto_analyze_failures: bool = True
     output_capture_bytes: int = 48_000
     context_commands: int = 8
@@ -39,6 +41,62 @@ class Config:
 
 def config_dir() -> Path:
     return Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "sysai"
+
+
+def model_profiles_path() -> Path:
+    return config_dir() / "models.toml"
+
+
+@dataclass(frozen=True)
+class ModelProfile:
+    id: str
+    provider: str
+    name: str
+    base_url: str
+    api_key_env: str = ""
+
+
+def load_model_profiles(path: Path | None = None) -> list[ModelProfile]:
+    path = path or model_profiles_path()
+    if not path.exists():
+        return []
+    try:
+        with path.open("rb") as handle:
+            raw = tomllib.load(handle)
+    except (OSError, tomllib.TOMLDecodeError):
+        return []
+    result = []
+    for item in raw.get("model", []):
+        try:
+            profile = ModelProfile(**{key: item[key] for key in ("id", "provider", "name", "base_url")},
+                                   api_key_env=item.get("api_key_env", ""))
+        except (KeyError, TypeError):
+            continue
+        if profile.id and profile.provider and profile.name and profile.base_url:
+            result.append(profile)
+    return result
+
+
+def save_model_profiles(profiles: list[ModelProfile], path: Path | None = None) -> Path:
+    path = path or model_profiles_path()
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    lines = []
+    for profile in profiles:
+        lines.append("[[model]]")
+        for key, value in asdict(profile).items():
+            lines.append(f"{key} = {_format_toml_value(value)}")
+        lines.append("")
+    fd, temporary = tempfile.mkstemp(prefix=".models-", dir=path.parent)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write("\n".join(lines))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+    return path
 
 
 def state_dir() -> Path:

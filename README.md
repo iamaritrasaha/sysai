@@ -68,6 +68,7 @@ The welcome and goodbye screens adapt to your terminal width and stay clean unde
 | `sysai stop` | End the session cleanly |
 | `sysai --model [MODEL]` | Select a discovered model for this launch (interactive when omitted) |
 | `sysai models` / `sysai models use MODEL` | List models/providers / save the default |
+| `sysai models add` / `sysai models remove ID` | Configure or remove a provider profile |
 | `sysai dmesg`, `sysai --web dmesg` | Command Insight: inspect an allowlisted read-only command |
 
 Run `sysai --help` or `sysai <command> --help` for full options.
@@ -81,7 +82,7 @@ cd sysai
 sysai
 ```
 
-Requires Linux, Bash 5.x, Python 3.11+, and [Ollama](https://ollama.com) with a local model installed. Local models are discovered automatically and local is the default. `sysai --model` selects interactively; `sysai models` lists available models. Optional OpenAI-compatible remote providers require explicit endpoint/API-key configuration and consent. History and memory remain local.
+Requires Linux, Bash 5.x, Python 3.11+, and [Ollama](https://ollama.com) with a local model installed. Local Ollama models are discovered automatically and local is the default. SysAI also supports configured remote Ollama servers and generic OpenAI-compatible APIs: use `sysai models add`, then `sysai --model` or `sysai models use <id>`. Remote use requires explicit endpoint/API-key-environment configuration and consent; privacy controls run before remote requests, and history and memory remain local.
 
 ```sh
 sysai health

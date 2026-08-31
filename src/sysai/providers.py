@@ -132,6 +132,6 @@ class OpenAICompatibleProvider:
 def provider_for(config: Config) -> ModelProvider:
     if config.provider.lower() == "ollama":
         return OllamaProvider(config)
-    if config.provider.lower() in ("openai", "openai-compatible", "remote"):
+    if config.provider.lower() in ("openai", "openai-compatible", "openai_compatible", "remote"):
         return OpenAICompatibleProvider(config)
     raise OllamaError(f"Unknown model provider: {config.provider}")

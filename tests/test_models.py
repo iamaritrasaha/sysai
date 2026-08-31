@@ -8,7 +8,8 @@ from pathlib import Path
 from unittest import mock
 
 from sysai import cli
-from sysai.config import Config, load_config
+from sysai.config import (Config, ModelProfile, load_config, load_model_profiles,
+                          save_model_profiles)
 from sysai.ollama import OllamaManager
 from sysai.providers import OpenAICompatibleProvider, provider_for
 
@@ -20,6 +21,25 @@ class ModelTests(unittest.TestCase):
             self.assertEqual(manager.models(), ["llama3:8b", "mistral:7b"])
         with mock.patch("sysai.ollama._request", side_effect=OSError):
             self.assertEqual(manager.models(), [])
+
+    def test_remote_ollama_uses_the_configured_base_url(self):
+        manager = OllamaManager(Config(ollama_url="http://192.0.2.10:11434"))
+        with mock.patch("sysai.ollama._request") as request:
+            request.return_value = {"models": [{"name": "qwen3:8b"}]}
+            self.assertEqual(manager.models(), ["qwen3:8b"])
+            request.assert_called_once_with("http://192.0.2.10:11434/api/tags", timeout=2)
+
+    def test_multiple_profiles_are_saved_without_secrets(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "models.toml"
+            save_model_profiles([
+                ModelProfile("remote-ollama", "ollama", "qwen3:8b", "http://192.0.2.10:11434"),
+                ModelProfile("api", "openai_compatible", "remote", "https://example.test/v1", "SYSAI_API_KEY"),
+            ], path)
+            profiles = load_model_profiles(path)
+            self.assertEqual([profile.id for profile in profiles], ["remote-ollama", "api"])
+            self.assertNotIn("secret", path.read_text())
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
 
     def test_provider_routing(self):
         self.assertEqual(provider_for(Config()).name, "Ollama")

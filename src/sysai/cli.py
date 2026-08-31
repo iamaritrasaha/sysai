@@ -12,7 +12,8 @@ from . import __version__, baseline, changes, monitor, reports, updater, whatis
 from . import history as history_mod
 from . import memory as memory_mod
 from .collect import run as _command
-from .config import load_config, set_config_value, state_dir
+from .config import (Config, ModelProfile, load_config, load_model_profiles,
+                     save_model_profiles, set_config_value, state_dir)
 from .diagnostics import action_details, prompt_permission
 from .display import AnswerRenderer
 from .doctor import doctor_command
@@ -605,19 +606,85 @@ def context_command() -> int:
 
 
 def _qualified_model(value: str) -> tuple[str, str]:
-    if ":" in value and value.split(":", 1)[0].lower() in ("ollama", "remote", "openai", "openai-compatible"):
+    if ":" in value and value.split(":", 1)[0].lower() in ("ollama", "remote", "openai", "openai-compatible", "openai_compatible"):
         provider, name = value.split(":", 1)
         return ("ollama" if provider.lower() == "ollama" else "openai-compatible", name)
     return load_config().provider, value
 
 
+def _profile_config(config: Config, profile: ModelProfile) -> Config:
+    return dataclasses.replace(config, provider=profile.provider, model=profile.name,
+                               ollama_url=profile.base_url if profile.provider == "ollama" else config.ollama_url,
+                               model_endpoint=profile.base_url, api_key_env=profile.api_key_env,
+                               active_model_id=profile.id)
+
+
+def _profile_status(profile: ModelProfile) -> tuple[bool, str]:
+    candidate = _profile_config(load_config(), profile)
+    if profile.provider == "ollama":
+        manager = OllamaManager(candidate)
+        if not manager.available():
+            return False, "unreachable"
+        if profile.name not in manager.models():
+            return False, "model unavailable"
+        return True, profile.base_url
+    provider = OpenAICompatibleProvider(candidate)
+    return provider.available(), ("configured" if provider.available() else "missing API key")
+
+
+def add_model_profile() -> int:
+    print("Provider\n\n  1. Local Ollama\n  2. Remote Ollama\n  3. OpenAI-compatible API")
+    try:
+        choice = input("\nSelect [1-3]: ").strip()
+        if choice not in ("1", "2", "3"):
+            raise ValueError
+        if choice == "1":
+            endpoint, provider = "http://127.0.0.1:11434", "ollama"
+        else:
+            endpoint = input("Endpoint: ").strip().rstrip("/")
+            provider = "ollama" if choice == "2" else "openai-compatible"
+        model = input("Model: ").strip()
+        api_key_env = "" if provider == "ollama" else input("API key environment variable: ").strip()
+    except (EOFError, KeyboardInterrupt, ValueError):
+        print("SysAI: provider setup cancelled.", file=sys.stderr)
+        return 1
+    if not endpoint or not model or (provider != "ollama" and not api_key_env):
+        print("SysAI: endpoint, model, and API key environment variable are required.", file=sys.stderr)
+        return 2
+    profiles = load_model_profiles()
+    prefix = "local-ollama" if choice == "1" else "remote-ollama" if choice == "2" else "api"
+    used = {profile.id for profile in profiles}
+    index, profile_id = 1, prefix
+    while profile_id in used:
+        index += 1
+        profile_id = f"{prefix}-{index}"
+    profile = ModelProfile(profile_id, provider, model, endpoint, api_key_env)
+    save_model_profiles([*profiles, profile])
+    print(f"SysAI: added model profile {profile.id}. Use `sysai models use {profile.id}` to select it.")
+    return 0
+
+
 def models_command(action: str | None = None, model: str | None = None) -> int:
     config = load_config()
+    profiles = load_model_profiles()
+    if action == "add":
+        return add_model_profile()
+    if action == "remove":
+        target = next((profile for profile in profiles if profile.id == model), None)
+        if target is None:
+            print(f"SysAI: no model profile named '{model}'.", file=sys.stderr)
+            return 1
+        save_model_profiles([profile for profile in profiles if profile.id != model])
+        print(f"SysAI: removed model profile {model}.")
+        return 0
     if action == "use":
         if not model:
             print("SysAI: please provide a model name.", file=sys.stderr)
             return 2
-        provider, name = _qualified_model(model)
+        profile = next((item for item in profiles if item.id == model), None)
+        provider, name = (profile.provider, profile.name) if profile else _qualified_model(model)
+        if profile:
+            config = _profile_config(config, profile)
         candidate = dataclasses.replace(config, provider=provider, model=name)
         if provider == "ollama":
             manager = OllamaManager(candidate)
@@ -632,6 +699,10 @@ def models_command(action: str | None = None, model: str | None = None) -> int:
             return 1
         set_config_value("provider", provider)
         set_config_value("model", name)
+        set_config_value("ollama_url", candidate.ollama_url)
+        set_config_value("model_endpoint", candidate.model_endpoint)
+        set_config_value("api_key_env", candidate.api_key_env)
+        set_config_value("active_model_id", profile.id if profile else "")
         print(f"SysAI: default model saved: {name} · {provider}")
         return 0
     if action == "consent-reset":
@@ -648,9 +719,13 @@ def models_command(action: str | None = None, model: str | None = None) -> int:
     else:
         print("  (Ollama unavailable or no installed models)")
     print("\nREMOTE")
-    if config.provider != "ollama" and config.model_endpoint:
-        mark = "✓" if config.provider != "ollama" and config.model == config.model else "○"
-        print(f"  {mark} {config.model}\n    {config.provider} (configured)")
+    remote_profiles = [profile for profile in profiles if profile.provider != "ollama" or profile.base_url != config.ollama_url]
+    if remote_profiles:
+        for profile in remote_profiles:
+            available, detail = _profile_status(profile)
+            mark = "✓" if available else "✗"
+            selected = " · selected" if config.active_model_id == profile.id else ""
+            print(f"  {mark} {profile.id}: {profile.name}\n    {profile.provider} · {profile.base_url}{selected}\n    {detail}")
     else:
         print("  (no remote model configured)")
     print(f"\nDefault\n  {config.model} · {config.provider}")
@@ -661,22 +736,28 @@ def select_model() -> tuple[str, str] | None:
     config = load_config()
     manager = OllamaManager(config)
     local = manager.models() if manager.available() else []
-    choices = [("ollama", name) for name in local]
-    if config.provider != "ollama" and config.model_endpoint:
-        choices.append((config.provider, config.model))
+    choices = [("ollama", name, "") for name in local]
+    for profile in load_model_profiles():
+        available, _ = _profile_status(profile)
+        if available:
+            choices.append((profile.provider, profile.name, profile.id))
     if not choices:
-        print("SysAI: no available models/providers found.", file=sys.stderr)
+        print("SysAI: no available models/providers found.\nAdd one with: sysai models add", file=sys.stderr)
         return None
     print("SysAI Models\n\nLOCAL")
-    for index, (provider, name) in enumerate(choices, 1):
-        print(f"  {index}. {'✓' if provider == config.provider and name == config.model else ' '} {name} ({provider})")
+    for index, (provider, name, profile_id) in enumerate(choices, 1):
+        location = "local" if not profile_id else next(p.base_url for p in load_model_profiles() if p.id == profile_id)
+        print(f"  {index}. {'✓' if (config.active_model_id == profile_id or (not profile_id and config.provider == provider and config.model == name)) else ' '} {name}\n      {provider} · {location}")
+    print("\nSelect [1-{}]: ".format(len(choices)), end="")
     try:
-        raw = input(f"\nSelect [1-{len(choices)}]: ").strip() or "1"
+        raw = input().strip() or "1"
         index = int(raw)
-        provider, name = choices[index - 1]
+        provider, name, profile_id = choices[index - 1]
     except (ValueError, IndexError, EOFError, KeyboardInterrupt):
         print("SysAI: model selection cancelled.", file=sys.stderr)
         return None
+    if profile_id:
+        return "profile", profile_id
     return provider, name
 
 
@@ -756,7 +837,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("stop", help="stop an active SysAI session")
 
     models = sub.add_parser("models", help="list available providers/models")
-    models.add_argument("action", nargs="?", choices=["use", "consent-reset"],
+    models.add_argument("action", nargs="?", choices=["add", "remove", "use", "consent-reset"],
                         help="save a default model or reset remote consent")
     models.add_argument("model", nargs="?", help="model name, optionally provider:model")
 
@@ -811,7 +892,14 @@ def main(argv: list[str] | None = None) -> int:
         if selected is None:
             return 1
         provider, name = selected
-        launch_config = dataclasses.replace(load_config(), provider=provider, model=name)
+        if provider == "profile":
+            profile = next((item for item in load_model_profiles() if item.id == name), None)
+            if profile is None:
+                print(f"SysAI: model profile '{name}' no longer exists.", file=sys.stderr)
+                return 1
+            launch_config = _profile_config(load_config(), profile)
+        else:
+            launch_config = dataclasses.replace(load_config(), provider=provider, model=name)
     if args.command == "explain":
         return _stream_session_request("explain")
     if args.command == "investigate":

@@ -16,7 +16,7 @@ SysAI supervises a real interactive Bash started with fixed argv (`bash --rcfile
 
 SysAI displays model advice but never executes model-generated commands. The user remains responsible for reviewing and manually running suggestions. Terminal content is processed locally by default; explicit web searches send only a sanitized query to the configured provider.
 
-Model providers are local-first and remote providers are opt-in. Before a remote request, the existing shared privacy layer filters secrets, raw history, raw memory, credentials, private identifiers, and prohibited paths. API keys are read from an environment variable and are never written to tracked configuration. There is no automatic local-to-remote fallback. Model output remains advice and cannot execute commands; diagnostics continue through the audited action catalogue with explicit approval for privileged actions.
+Model providers are local-first and remote providers are opt-in. Provider profiles are stored locally with restrictive permissions; API keys are read from environment variables and are never written to configuration. Before a remote request, the existing shared privacy layer filters secrets, raw history, raw memory, credentials, private identifiers, and prohibited paths. There is no automatic local-to-remote or remote-to-local fallback. Model output remains advice and cannot execute commands; diagnostics continue through the audited action catalogue with explicit approval for privileged actions.
 
 ## Diagnostic engine
 
