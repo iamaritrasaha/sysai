@@ -27,7 +27,7 @@ class ModelTests(unittest.TestCase):
         with mock.patch("sysai.ollama._request") as request:
             request.return_value = {"models": [{"name": "qwen3:8b"}]}
             self.assertEqual(manager.models(), ["qwen3:8b"])
-            request.assert_called_once_with("http://192.0.2.10:11434/api/tags", timeout=2)
+            request.assert_called_once_with("http://192.0.2.10:11434/api/tags", timeout=2, headers={})
 
     def test_multiple_profiles_are_saved_without_secrets(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -80,10 +80,26 @@ class ModelTests(unittest.TestCase):
         with mock.patch("sysai.cli.models_command", return_value=0) as handler:
             self.assertEqual(cli.main(["models"]), 0)
             handler.assert_called_once_with(None, None)
-        with mock.patch("sysai.cli.select_model", return_value=("ollama", "llama3:8b")), \
+        with mock.patch("sysai.cli.select_model", return_value=Config()), \
              mock.patch("sysai.cli.Session.run", return_value=0):
             # No active tty is required until Session.run, which is mocked.
             self.assertEqual(cli.main(["--model"]), 0)
+
+    def test_normal_startup_uses_the_selector_and_default(self):
+        with mock.patch("sysai.cli.select_model", return_value=Config(model="llama3:3b")), \
+             mock.patch("sysai.cli.Session.run", return_value=0) as run:
+            self.assertEqual(cli.main([]), 0)
+            run.assert_called_once()
+
+    def test_selector_enter_chooses_marked_default_and_explains_remote_setup(self):
+        output = io.StringIO()
+        with mock.patch("sysai.cli.load_config", return_value=Config(model="qwen3:8b")), \
+             mock.patch("sysai.cli._startup_choices", return_value=[("LOCAL", "ollama", "qwen3:8b", "http://127.0.0.1:11434", "")]), \
+             mock.patch("builtins.input", return_value=""), \
+             mock.patch("sys.stdout", output):
+            selected = cli.select_model()
+        self.assertEqual(selected.model, "qwen3:8b")
+        self.assertIn("sysai models add", output.getvalue())
 
 
 if __name__ == "__main__":

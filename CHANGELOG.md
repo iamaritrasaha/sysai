@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Startup model selection now discovers local/remote choices, keeps the saved model as the default, and supports hosted Ollama models with explicit consent.
 - Multi-provider model selection with automatic local Ollama discovery, a provider abstraction, optional OpenAI-compatible remote providers, and explicit cloud consent. Bash history and memory remain local and no provider fallback is performed.
 
 All notable changes to this project will be documented here.

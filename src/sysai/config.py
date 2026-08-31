@@ -44,7 +44,7 @@ def config_dir() -> Path:
 
 
 def model_profiles_path() -> Path:
-    return config_dir() / "models.toml"
+    return config_dir() / "config.toml"
 
 
 @dataclass(frozen=True)
@@ -66,7 +66,7 @@ def load_model_profiles(path: Path | None = None) -> list[ModelProfile]:
     except (OSError, tomllib.TOMLDecodeError):
         return []
     result = []
-    for item in raw.get("model", []):
+    for item in raw.get("model_profile", []):
         try:
             profile = ModelProfile(**{key: item[key] for key in ("id", "provider", "name", "base_url")},
                                    api_key_env=item.get("api_key_env", ""))
@@ -80,9 +80,15 @@ def load_model_profiles(path: Path | None = None) -> list[ModelProfile]:
 def save_model_profiles(profiles: list[ModelProfile], path: Path | None = None) -> Path:
     path = path or model_profiles_path()
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    lines = []
+    existing = path.read_text(encoding="utf-8") if path.exists() else ""
+    # Profile records are the managed tail of the normal SysAI config file;
+    # ordinary user settings above them are preserved byte-for-byte.
+    marker = "[[model_profile]]"
+    if marker in existing:
+        existing = existing[:existing.index(marker)].rstrip() + "\n"
+    lines = [existing.rstrip(), ""] if existing.strip() else []
     for profile in profiles:
-        lines.append("[[model]]")
+        lines.append("[[model_profile]]")
         for key, value in asdict(profile).items():
             lines.append(f"{key} = {_format_toml_value(value)}")
         lines.append("")

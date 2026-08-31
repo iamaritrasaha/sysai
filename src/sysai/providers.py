@@ -5,6 +5,7 @@ import json
 import os
 import urllib.error
 import urllib.request
+import dataclasses
 from typing import Protocol
 
 from .config import Config
@@ -43,6 +44,16 @@ class OllamaProvider:
 
     def cleanup(self):
         self.manager.cleanup()
+
+
+class OllamaCloudProvider(OllamaProvider):
+    """Direct Ollama cloud API, using the documented API-key environment variable."""
+    name = "Ollama Cloud"
+    remote = True
+
+    def __init__(self, config: Config):
+        cloud_config = dataclasses.replace(config, ollama_url="https://ollama.com")
+        self.manager = OllamaManager(cloud_config, auth_env="OLLAMA_API_KEY")
 
 
 class OpenAICompatibleProvider:
@@ -130,6 +141,8 @@ class OpenAICompatibleProvider:
 
 
 def provider_for(config: Config) -> ModelProvider:
+    if config.provider.lower() in ("ollama-cloud", "ollama_cloud"):
+        return OllamaCloudProvider(config)
     if config.provider.lower() == "ollama":
         return OllamaProvider(config)
     if config.provider.lower() in ("openai", "openai-compatible", "openai_compatible", "remote"):

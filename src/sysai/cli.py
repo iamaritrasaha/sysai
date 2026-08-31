@@ -22,7 +22,7 @@ from .health import collect_scope
 from .insight import classify, execute, permission_failure, permission_purpose
 from .intent import keyword_route
 from .ollama import OllamaError, OllamaManager, is_owned_ollama_process
-from .providers import OpenAICompatibleProvider
+from .providers import OllamaCloudProvider, OpenAICompatibleProvider
 from .render import render_document
 from .session import Session
 
@@ -732,33 +732,91 @@ def models_command(action: str | None = None, model: str | None = None) -> int:
     return 0
 
 
-def select_model() -> tuple[str, str] | None:
+def _startup_choices(config: Config) -> list[tuple[str, str, str, str, str]]:
+    """Return (section, provider, model, endpoint, profile_id) choices."""
+    choices = []
+    local = OllamaManager(config)
+    local_models = local.models() if local.available() else []
+    for name in local_models:
+        section = "OLLAMA CLOUD" if name.lower().endswith(":cloud") else "LOCAL"
+        choices.append((section, "ollama", name, config.ollama_url, ""))
+    profiles = load_model_profiles()
+    for profile in profiles:
+        candidate = _profile_config(config, profile)
+        if profile.provider == "ollama":
+            manager = OllamaManager(candidate)
+            names = manager.models() if manager.available() else []
+            for name in names:
+                if profile.base_url.rstrip("/") == config.ollama_url.rstrip("/"):
+                    continue
+                choices.append(("REMOTE OLLAMA", "ollama", name, profile.base_url, profile.id))
+        elif OpenAICompatibleProvider(candidate).available():
+            choices.append(("OTHER", profile.provider, profile.name, profile.base_url, profile.id))
+    if os.environ.get("OLLAMA_API_KEY"):
+        cloud = OllamaCloudProvider(config)
+        for name in cloud.manager.models():
+            choices.append(("OLLAMA CLOUD", "ollama-cloud", name, "https://ollama.com", "cloud:" + name))
+    return choices
+
+
+def _choice_config(config: Config, choice: tuple[str, str, str, str, str]) -> Config:
+    _section, provider, name, endpoint, profile_id = choice
+    if profile_id and not profile_id.startswith("cloud:"):
+        profile = next((item for item in load_model_profiles() if item.id == profile_id), None)
+        if profile:
+            return _profile_config(config, profile)
+    return dataclasses.replace(config, provider=provider, model=name,
+                               ollama_url=endpoint if provider == "ollama" else config.ollama_url,
+                               model_endpoint=endpoint if provider != "ollama" else config.model_endpoint,
+                               active_model_id=profile_id)
+
+
+def select_model() -> Config | None:
     config = load_config()
-    manager = OllamaManager(config)
-    local = manager.models() if manager.available() else []
-    choices = [("ollama", name, "") for name in local]
-    for profile in load_model_profiles():
-        available, _ = _profile_status(profile)
-        if available:
-            choices.append((profile.provider, profile.name, profile.id))
+    choices = _startup_choices(config)
     if not choices:
-        print("SysAI: no available models/providers found.\nAdd one with: sysai models add", file=sys.stderr)
+        print("SysAI Models\n\nLOCAL\n  (no available local models)\n\nOLLAMA CLOUD\n  (not configured)\n\nOTHER\n  (no configured remote API)\n\nAdd a provider with: sysai models add", file=sys.stderr)
         return None
-    print("SysAI Models\n\nLOCAL")
-    for index, (provider, name, profile_id) in enumerate(choices, 1):
-        location = "local" if not profile_id else next(p.base_url for p in load_model_profiles() if p.id == profile_id)
-        print(f"  {index}. {'✓' if (config.active_model_id == profile_id or (not profile_id and config.provider == provider and config.model == name)) else ' '} {name}\n      {provider} · {location}")
-    print("\nSelect [1-{}]: ".format(len(choices)), end="")
+    print("SysAI\nLocal Linux Intelligence\n\nSelect a model\n")
+    current = None
+    shown_sections = set()
+    for index, (section, provider, name, endpoint, profile_id) in enumerate(choices, 1):
+        if section not in shown_sections:
+            if shown_sections:
+                print()
+            print(section)
+            shown_sections.add(section)
+        marked = ((bool(profile_id) and config.active_model_id == profile_id) or
+                  (not profile_id and not config.active_model_id and config.provider == provider and config.model == name))
+        location = "Local" if section == "LOCAL" else "Cloud" if section == "OLLAMA CLOUD" else endpoint
+        print(f"  {index}. {'✓' if marked else ' '} {name}\n      Ollama · {location}" if provider.startswith("ollama") else
+              f"  {index}. {'✓' if marked else ' '} {name}\n      Compatible API · {endpoint}")
+        if marked:
+            current = index
+    placeholders = {
+        "REMOTE OLLAMA": "(no remote Ollama configured)",
+        "OLLAMA CLOUD": "(not configured; sign in with Ollama or set OLLAMA_API_KEY)",
+        "OTHER": "(no configured remote API)",
+    }
+    for section, placeholder in placeholders.items():
+        if section not in shown_sections:
+            print(f"\n{section}\n  {placeholder}")
+    if not any(section in shown_sections for section in ("REMOTE OLLAMA", "OTHER")):
+        print("\nAdd a remote model with: sysai models add")
+    if len(choices) == 1:
+        print("\nPress Enter to continue, or choose another model.")
+    else:
+        print(f"\nSelect [1-{len(choices)}]" + (f" (default {current})" if current else "") + ": ", end="")
     try:
-        raw = input().strip() or "1"
-        index = int(raw)
-        provider, name, profile_id = choices[index - 1]
+        raw = input().strip()
+        index = current or 1 if not raw else int(raw)
+        choice = choices[index - 1]
     except (ValueError, IndexError, EOFError, KeyboardInterrupt):
         print("SysAI: model selection cancelled.", file=sys.stderr)
         return None
-    if profile_id:
-        return "profile", profile_id
-    return provider, name
+    selected = _choice_config(config, choice)
+    print(f"\n✓ Model selected: {selected.model}")
+    return selected
 
 
 # Every word argparse owns. A reserved word is never re-interpreted as a raw
@@ -888,18 +946,17 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     launch_config = None
     if args.model_override is not None:
-        selected = select_model() if args.model_override == "__select__" else _qualified_model(args.model_override)
-        if selected is None:
-            return 1
-        provider, name = selected
-        if provider == "profile":
-            profile = next((item for item in load_model_profiles() if item.id == name), None)
-            if profile is None:
-                print(f"SysAI: model profile '{name}' no longer exists.", file=sys.stderr)
-                return 1
-            launch_config = _profile_config(load_config(), profile)
+        if args.model_override == "__select__":
+            launch_config = select_model()
         else:
-            launch_config = dataclasses.replace(load_config(), provider=provider, model=name)
+            profile = next((item for item in load_model_profiles() if item.id == args.model_override), None)
+            if profile:
+                launch_config = _profile_config(load_config(), profile)
+            else:
+                provider, name = _qualified_model(args.model_override)
+                launch_config = dataclasses.replace(load_config(), provider=provider, model=name)
+        if launch_config is None:
+            return 1
     if args.command == "explain":
         return _stream_session_request("explain")
     if args.command == "investigate":
@@ -945,7 +1002,11 @@ def main(argv: list[str] | None = None) -> int:
     if os.environ.get("SYSAI_SESSION"):
         parser.print_help()
         return 0
-    config = launch_config or load_config()
+    config = launch_config
+    if config is None:
+        config = select_model()
+        if config is None:
+            return 1
     if config.provider != "ollama" and not config.remote_consent:
         print("Remote model selected.\n\nSanitized diagnostic context may be sent to a remote service.\n"
               "Local Bash history and private memory remain on this machine.\n")

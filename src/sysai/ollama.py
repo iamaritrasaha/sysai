@@ -62,11 +62,12 @@ class StreamHandle:
             pass
 
 
-def _request(url: str, method: str = "GET", body: dict | None = None, timeout: float = 3) -> dict:
+def _request(url: str, method: str = "GET", body: dict | None = None, timeout: float = 3,
+             headers: dict[str, str] | None = None) -> dict:
     data = json.dumps(body).encode() if body is not None else None
     request = urllib.request.Request(
         url, data=data, method=method,
-        headers={"Content-Type": "application/json"} if data else {},
+        headers={"Content-Type": "application/json", **(headers or {})} if data else (headers or {}),
     )
     with urllib.request.urlopen(request, timeout=timeout) as response:
         return json.loads(response.read() or b"{}")
@@ -79,6 +80,11 @@ class OllamaManager:
     started_by_sysai: bool = False
     startup_succeeded: bool = False
     log_path: Path | None = None
+    auth_env: str = ""
+
+    def _auth_headers(self) -> dict[str, str]:
+        token = os.environ.get(self.auth_env, "") if self.auth_env else ""
+        return {"Authorization": f"Bearer {token}"} if token else {}
 
     def process_start_time(self) -> int | None:
         if self.process is None:
@@ -87,14 +93,14 @@ class OllamaManager:
 
     def available(self) -> bool:
         try:
-            _request(f"{self.config.ollama_url}/api/version", timeout=1)
+            _request(f"{self.config.ollama_url}/api/version", timeout=1, headers=self._auth_headers())
             return True
         except (OSError, urllib.error.URLError, json.JSONDecodeError):
             return False
 
     def models(self) -> list[str]:
         try:
-            payload = _request(f"{self.config.ollama_url}/api/tags", timeout=2)
+            payload = _request(f"{self.config.ollama_url}/api/tags", timeout=2, headers=self._auth_headers())
             return [str(item["name"]) for item in payload.get("models", []) if isinstance(item, dict) and item.get("name")]
         except (OSError, urllib.error.URLError, json.JSONDecodeError, TypeError, KeyError):
             return []
@@ -163,7 +169,7 @@ class OllamaManager:
         }
         request = urllib.request.Request(
             f"{self.config.ollama_url}/api/chat", data=json.dumps(body).encode(),
-            method="POST", headers={"Content-Type": "application/json"},
+            method="POST", headers={"Content-Type": "application/json", **self._auth_headers()},
         )
         try:
             response = urllib.request.urlopen(request, timeout=self.config.request_timeout_seconds)
@@ -220,7 +226,7 @@ class OllamaManager:
         try:
             _request(
                 f"{self.config.ollama_url}/api/generate", "POST",
-                {"model": self.config.model, "keep_alive": 0}, timeout=10,
+                {"model": self.config.model, "keep_alive": 0}, timeout=10, headers=self._auth_headers(),
             )
         except (OSError, urllib.error.URLError, json.JSONDecodeError):
             pass

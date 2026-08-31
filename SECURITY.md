@@ -18,6 +18,8 @@ SysAI displays model advice but never executes model-generated commands. The use
 
 Model providers are local-first and remote providers are opt-in. Provider profiles are stored locally with restrictive permissions; API keys are read from environment variables and are never written to configuration. Before a remote request, the existing shared privacy layer filters secrets, raw history, raw memory, credentials, private identifiers, and prohibited paths. There is no automatic local-to-remote or remote-to-local fallback. Model output remains advice and cannot execute commands; diagnostics continue through the audited action catalogue with explicit approval for privileged actions.
 
+Startup discovery distinguishes local Ollama, separately configured Ollama servers, hosted Ollama models, and compatible remote APIs. Hosted access uses the documented Ollama API endpoint and `OLLAMA_API_KEY` when configured; SysAI never signs in, invents credentials, or silently enables hosted access.
+
 ## Diagnostic engine
 
 SysAI has three layers, and they are not interchangeable:
