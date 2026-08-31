@@ -30,6 +30,7 @@ from . import memory as memory_mod
 from .insight import meaningful_anomaly, prepare_evidence, safe_research_query
 from .intent import classification_prompt, parse_domain
 from .ollama import OllamaCancelled, OllamaError, OllamaManager, StreamHandle
+from .providers import provider_for
 from .prompt import assessment_prompt, failure_prompt, research_block, system_prompt
 from .redact import redact, truncate_output
 from .web import OllamaWebSearch, WebSearchError, sanitize_search_query
@@ -116,6 +117,9 @@ class Session:
         self.socket_path = self.runtime / f"session-{os.getpid()}.sock"
         self.state_path = self.runtime / "active.json"
         self.ollama = OllamaManager(config)
+        self.provider = provider_for(config)
+        if hasattr(self.provider, "manager"):
+            self.provider.manager = self.ollama
         self.records: collections.deque[dict] = collections.deque(maxlen=config.context_commands)
         self.discussion: collections.deque[dict[str, str]] = collections.deque(maxlen=8)
         self.current: dict | None = None
@@ -265,6 +269,8 @@ class Session:
             value = bool(request.get("value"))
             self.config = dataclasses.replace(self.config, thinking=value)
             self.ollama.config = self.config
+            if hasattr(self.provider, "config"):
+                self.provider.config = self.config
             return {"ok": True, "thinking": value}
         return {"ok": False, "error": f"Unknown session action: {action}"}
 
@@ -699,7 +705,7 @@ class Session:
         messages.extend(self.discussion)
         messages.append({"role": "user", "content": prompt})
         with self.model_lock:
-            return self.ollama.stream_chat(
+            return self.provider.stream_request(
                 messages, on_thinking=on_thinking, on_content=on_content, handle=handle,
             )
 
@@ -807,8 +813,11 @@ class Session:
         if not os.isatty(0) or not os.isatty(1):
             raise RuntimeError("`sysai` must be started from an interactive terminal.")
         self._acquire_session_lock()
-        self.ollama.ensure_ready(self.runtime)
-        _safe_write(1, startup_banner(self.config.model).encode())
+        if self.config.provider == "ollama":
+            self.ollama.ensure_ready(self.runtime)
+            if not self.ollama.model_available():
+                raise OllamaError(f"Model '{self.config.model}' is not installed in Ollama. Use `sysai models` to see installed models.")
+        _safe_write(1, startup_banner(self.config.model, ollama_ready=(self.config.provider == "ollama" or self.provider.available())).encode())
         event_r, event_w = os.pipe()
         response_r, response_w = os.pipe()
         for fd in (event_w, response_r):
@@ -933,7 +942,7 @@ class Session:
                     self.state_path.unlink()
         except (OSError, json.JSONDecodeError):
             pass
-        self.ollama.cleanup()
+        self.provider.cleanup()
         if self.lock_fd is not None:
             try:
                 fcntl.flock(self.lock_fd, fcntl.LOCK_UN)

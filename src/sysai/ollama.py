@@ -92,6 +92,16 @@ class OllamaManager:
         except (OSError, urllib.error.URLError, json.JSONDecodeError):
             return False
 
+    def models(self) -> list[str]:
+        try:
+            payload = _request(f"{self.config.ollama_url}/api/tags", timeout=2)
+            return [str(item["name"]) for item in payload.get("models", []) if isinstance(item, dict) and item.get("name")]
+        except (OSError, urllib.error.URLError, json.JSONDecodeError, TypeError, KeyError):
+            return []
+
+    def model_available(self) -> bool:
+        return self.config.model in self.models()
+
     def ensure_ready(self, runtime_dir: Path) -> None:
         if self.available():
             return
@@ -158,7 +168,7 @@ class OllamaManager:
         try:
             response = urllib.request.urlopen(request, timeout=self.config.request_timeout_seconds)
         except (OSError, urllib.error.URLError) as exc:
-            raise OllamaError(f"Local Qwen request failed: {exc}") from exc
+            raise OllamaError(f"Local Ollama request failed: {exc}") from exc
         if handle is not None:
             handle.attach(response)
         content_parts: list[str] = []
@@ -176,7 +186,7 @@ class OllamaManager:
                     except json.JSONDecodeError:
                         continue
                     if "error" in chunk:
-                        raise OllamaError(f"Local Qwen request failed: {chunk['error']}")
+                        raise OllamaError(f"Local Ollama request failed: {chunk['error']}")
                     message = chunk.get("message") or {}
                     thinking_piece = message.get("thinking")
                     if thinking_piece and on_thinking is not None:
@@ -192,7 +202,7 @@ class OllamaManager:
         except (OSError, urllib.error.URLError) as exc:
             if handle is not None and handle.is_cancelled():
                 raise OllamaCancelled("Generation cancelled.") from exc
-            raise OllamaError(f"Local Qwen request failed: {exc}") from exc
+            raise OllamaError(f"Local Ollama request failed: {exc}") from exc
         # Cancelling closes the response to unblock a pending read, which
         # can also make the iterator end quietly (no exception) rather than
         # raise mid-loop. Re-check here so a cancellation never gets

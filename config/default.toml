@@ -1,6 +1,10 @@
 # SysAI defaults. The installer copies this to ~/.config/sysai/config.toml.
+provider = "ollama"
 model = "qwen3:8b"
 ollama_url = "http://127.0.0.1:11434"
+model_endpoint = ""
+api_key_env = "SYSAI_API_KEY"
+remote_consent = false
 auto_analyze_failures = true
 output_capture_bytes = 48000
 context_commands = 8

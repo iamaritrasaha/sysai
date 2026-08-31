@@ -8,7 +8,7 @@ SysAI is a local Linux intelligence and diagnostic companion. It observes a real
 - 🔍 Deterministic, read-only diagnostics across eight system domains
 - 🕘 History intelligence — relevant, sanitized, bounded — never a bulk dump
 - 🧠 Local experience memory — durable machine facts, incidents, corrections
-- 🔒 Local-first — no cloud memory, no forced web access, secrets redacted
+- 🔒 Local-first — multiple local models, optional remote providers, no cloud memory
 - 🧩 Standard-library-only Python; no package dependencies
 
 ## Why SysAI?
@@ -66,6 +66,8 @@ The welcome and goodbye screens adapt to your terminal width and stay clean unde
 | `sysai watch gpu` | Bounded foreground sampling |
 | `sysai update check` | Check for a verified SysAI release |
 | `sysai stop` | End the session cleanly |
+| `sysai --model [MODEL]` | Select a discovered model for this launch (interactive when omitted) |
+| `sysai models` / `sysai models use MODEL` | List models/providers / save the default |
 | `sysai dmesg`, `sysai --web dmesg` | Command Insight: inspect an allowlisted read-only command |
 
 Run `sysai --help` or `sysai <command> --help` for full options.
@@ -79,7 +81,7 @@ cd sysai
 sysai
 ```
 
-Requires Linux, Bash 5.x, Python 3.11+, and [Ollama](https://ollama.com) with a local model installed (default `qwen3:8b`). Then, inside or alongside the session:
+Requires Linux, Bash 5.x, Python 3.11+, and [Ollama](https://ollama.com) with a local model installed. Local models are discovered automatically and local is the default. `sysai --model` selects interactively; `sysai models` lists available models. Optional OpenAI-compatible remote providers require explicit endpoint/API-key configuration and consent. History and memory remain local.
 
 ```sh
 sysai health
@@ -126,7 +128,10 @@ Full guarantees, threat model, and vulnerability reporting: [SECURITY.md](SECURI
 Edit `~/.config/sysai/config.toml` (defaults in [`config/default.toml`](config/default.toml)):
 
 ```toml
+provider = "ollama"
 model = "qwen3:8b"
+model_endpoint = ""
+api_key_env = "SYSAI_API_KEY"
 web_enabled = false
 history_enabled = true
 history_mode = "relevant"      # off | relevant | recent | all

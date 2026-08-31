@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import os
 import signal
@@ -19,7 +20,8 @@ from .domains import DOMAINS, FULL_SYSTEM
 from .health import collect_scope
 from .insight import classify, execute, permission_failure, permission_purpose
 from .intent import keyword_route
-from .ollama import OllamaError, is_owned_ollama_process
+from .ollama import OllamaError, OllamaManager, is_owned_ollama_process
+from .providers import OpenAICompatibleProvider
 from .render import render_document
 from .session import Session
 
@@ -602,6 +604,82 @@ def context_command() -> int:
     return 0
 
 
+def _qualified_model(value: str) -> tuple[str, str]:
+    if ":" in value and value.split(":", 1)[0].lower() in ("ollama", "remote", "openai", "openai-compatible"):
+        provider, name = value.split(":", 1)
+        return ("ollama" if provider.lower() == "ollama" else "openai-compatible", name)
+    return load_config().provider, value
+
+
+def models_command(action: str | None = None, model: str | None = None) -> int:
+    config = load_config()
+    if action == "use":
+        if not model:
+            print("SysAI: please provide a model name.", file=sys.stderr)
+            return 2
+        provider, name = _qualified_model(model)
+        candidate = dataclasses.replace(config, provider=provider, model=name)
+        if provider == "ollama":
+            manager = OllamaManager(candidate)
+            if not manager.available():
+                print("SysAI: Ollama is unavailable; cannot verify that model.", file=sys.stderr)
+                return 1
+            if not manager.model_available():
+                print(f"SysAI: Ollama model '{name}' is not installed.", file=sys.stderr)
+                return 1
+        elif not OpenAICompatibleProvider(candidate).available():
+            print("SysAI: remote model requires a configured endpoint and API key environment variable.", file=sys.stderr)
+            return 1
+        set_config_value("provider", provider)
+        set_config_value("model", name)
+        print(f"SysAI: default model saved: {name} · {provider}")
+        return 0
+    if action == "consent-reset":
+        set_config_value("remote_consent", False)
+        print("SysAI: remote-provider consent reset.")
+        return 0
+    manager = OllamaManager(config)
+    local = manager.models() if manager.available() else []
+    print("SysAI Models\n\nLOCAL")
+    if local:
+        for name in local:
+            mark = "✓" if config.provider == "ollama" and config.model == name else "○"
+            print(f"  {mark} {name}\n    Ollama")
+    else:
+        print("  (Ollama unavailable or no installed models)")
+    print("\nREMOTE")
+    if config.provider != "ollama" and config.model_endpoint:
+        mark = "✓" if config.provider != "ollama" and config.model == config.model else "○"
+        print(f"  {mark} {config.model}\n    {config.provider} (configured)")
+    else:
+        print("  (no remote model configured)")
+    print(f"\nDefault\n  {config.model} · {config.provider}")
+    return 0
+
+
+def select_model() -> tuple[str, str] | None:
+    config = load_config()
+    manager = OllamaManager(config)
+    local = manager.models() if manager.available() else []
+    choices = [("ollama", name) for name in local]
+    if config.provider != "ollama" and config.model_endpoint:
+        choices.append((config.provider, config.model))
+    if not choices:
+        print("SysAI: no available models/providers found.", file=sys.stderr)
+        return None
+    print("SysAI Models\n\nLOCAL")
+    for index, (provider, name) in enumerate(choices, 1):
+        print(f"  {index}. {'✓' if provider == config.provider and name == config.model else ' '} {name} ({provider})")
+    try:
+        raw = input(f"\nSelect [1-{len(choices)}]: ").strip() or "1"
+        index = int(raw)
+        provider, name = choices[index - 1]
+    except (ValueError, IndexError, EOFError, KeyboardInterrupt):
+        print("SysAI: model selection cancelled.", file=sys.stderr)
+        return None
+    return provider, name
+
+
 # Every word argparse owns. A reserved word is never re-interpreted as a raw
 # Command Insight command, so `sysai disk` is the disk diagnostic and not an
 # attempt to run a program called `disk`.
@@ -609,13 +687,15 @@ RESERVED = {
     "explain", "investigate", "ask", "check", "health", "doctor", "what", "report",
     "baseline", "changes", "watch", "update", "thinking", "stop",
     "history", "memories", "remember", "feedback", "context",
-    *DOMAINS, "--help", "-h", "--version",
+    *DOMAINS, "models", "--model", "--help", "-h", "--version",
 }
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="sysai", description="Local AI-aware Bash session")
+    parser = argparse.ArgumentParser(prog="sysai", description="Local Linux Intelligence Bash session")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    parser.add_argument("--model", dest="model_override", nargs="?", const="__select__", metavar="MODEL",
+                        help="select a model, or open the interactive selector")
     sub = parser.add_subparsers(dest="command")
 
     sub.add_parser("explain", help="analyze the most recently completed command")
@@ -675,6 +755,11 @@ def build_parser() -> argparse.ArgumentParser:
     thinking.add_argument("state", choices=["on", "off", "status"])
     sub.add_parser("stop", help="stop an active SysAI session")
 
+    models = sub.add_parser("models", help="list available providers/models")
+    models.add_argument("action", nargs="?", choices=["use", "consent-reset"],
+                        help="save a default model or reset remote consent")
+    models.add_argument("model", nargs="?", help="model name, optionally provider:model")
+
     history_parser = sub.add_parser("history", help="SysAI's interpretation of recent relevant activity")
     history_parser.add_argument("--all", action="store_true", dest="all_mode",
                                 help="show bounded sanitized recent history, not just relevant activity")
@@ -720,6 +805,13 @@ def main(argv: list[str] | None = None) -> int:
 
     parser = build_parser()
     args = parser.parse_args(argv)
+    launch_config = None
+    if args.model_override is not None:
+        selected = select_model() if args.model_override == "__select__" else _qualified_model(args.model_override)
+        if selected is None:
+            return 1
+        provider, name = selected
+        launch_config = dataclasses.replace(load_config(), provider=provider, model=name)
     if args.command == "explain":
         return _stream_session_request("explain")
     if args.command == "investigate":
@@ -750,6 +842,8 @@ def main(argv: list[str] | None = None) -> int:
         return thinking_command(args.state)
     if args.command == "stop":
         return stop_outside()
+    if args.command == "models":
+        return models_command(args.action, args.model)
     if args.command == "history":
         return history_command(all_mode=args.all_mode, as_json=args.as_json)
     if args.command == "memories":
@@ -763,7 +857,19 @@ def main(argv: list[str] | None = None) -> int:
     if os.environ.get("SYSAI_SESSION"):
         parser.print_help()
         return 0
-    config = load_config()
+    config = launch_config or load_config()
+    if config.provider != "ollama" and not config.remote_consent:
+        print("Remote model selected.\n\nSanitized diagnostic context may be sent to a remote service.\n"
+              "Local Bash history and private memory remain on this machine.\n")
+        try:
+            approved = input("Continue? [y/N] ").strip().lower() in ("y", "yes")
+        except (EOFError, KeyboardInterrupt):
+            approved = False
+        if not approved:
+            print("SysAI: remote model selection cancelled.", file=sys.stderr)
+            return 1
+        set_config_value("remote_consent", True)
+        config = dataclasses.replace(config, remote_consent=True)
     executable = os.environ.get("SYSAI_EXECUTABLE", os.path.abspath(sys.argv[0]))
     session = Session(config, executable)
     try:

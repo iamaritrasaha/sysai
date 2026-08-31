@@ -10,8 +10,12 @@ from pathlib import Path
 
 @dataclass(frozen=True)
 class Config:
+    provider: str = "ollama"
     model: str = "qwen3:8b"
     ollama_url: str = "http://127.0.0.1:11434"
+    model_endpoint: str = ""
+    api_key_env: str = "SYSAI_API_KEY"
+    remote_consent: bool = False
     auto_analyze_failures: bool = True
     output_capture_bytes: int = 48_000
     context_commands: int = 8
@@ -82,6 +86,18 @@ def load_config(path: Path | None = None) -> Config:
         raw = tomllib.load(handle)
     allowed = Config.__dataclass_fields__.keys()
     values = {key: value for key, value in raw.items() if key in allowed}
+    model_section = raw.get("model") if isinstance(raw.get("model"), dict) else {}
+    if model_section:
+        values.update({key: model_section[key] for key in ("provider", "name", "endpoint", "api_key_env", "timeout") if key in model_section})
+        values["model"] = model_section.get("name", values.get("model", Config.model))
+        values["provider"] = model_section.get("provider", values.get("provider", Config.provider))
+        if "endpoint" in model_section:
+            values["model_endpoint"] = model_section["endpoint"]
+        if "timeout" in model_section:
+            values["request_timeout_seconds"] = model_section["timeout"]
+        values.pop("name", None)
+        values.pop("endpoint", None)
+        values.pop("timeout", None)
     return Config(**values)
 
 
