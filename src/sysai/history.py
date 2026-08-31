@@ -457,6 +457,45 @@ def group_by_domain(entries: list[dict]) -> dict[str, list[dict]]:
     return grouped
 
 
+def _event_key(entry: dict) -> tuple[str, int | None]:
+    """Stable key for collapsing repeated commands in the human view."""
+    command = " ".join(str(entry.get("command") or "").split())
+    return (command, entry.get("exit_status"))
+
+
+def _event_kind(entry: dict) -> str:
+    tokens = _tokens(entry.get("command", ""))
+    if entry.get("exit_status") not in (None, 0):
+        return "failure"
+    if _is_modifying(tokens):
+        return "change"
+    return "check"
+
+
+def summarize_events(entries: list[dict]) -> dict[str, list[dict]]:
+    """Group relevant history into concise, deterministic event summaries."""
+    grouped: dict[str, list[dict]] = {}
+    for domain, items in group_by_domain(entries).items():
+        summaries: dict[tuple[str, int | None], dict] = {}
+        for entry in items:
+            key = _event_key(entry)
+            summary = summaries.get(key)
+            if summary is None:
+                summary = {"entry": entry, "count": 0, "latest": entry,
+                           "kind": _event_kind(entry)}
+                summaries[key] = summary
+            summary["count"] += 1
+            latest_time = _entry_time(summary["latest"])
+            current_time = _entry_time(entry)
+            if current_time is not None and (latest_time is None or current_time > latest_time):
+                summary["latest"] = entry
+        grouped[domain] = sorted(summaries.values(),
+                                 key=lambda item: _entry_time(item["latest"]) or
+                                 dt.datetime.min.replace(tzinfo=dt.timezone.utc),
+                                 reverse=True)
+    return grouped
+
+
 def _age_label(entry: dict, anchor: dt.datetime) -> str:
     moment = _entry_time(entry)
     if moment is None:
@@ -486,18 +525,26 @@ def render_history(entries: list[dict], ignored_count: int, *, all_mode: bool = 
         lines.append("Recent sanitized activity")
         lines.append("─" * 26)
         for entry in entries:
+            timestamp = entry.get("timestamp") or "time unavailable"
+            status = entry.get("exit_status")
+            result = f"exit {status}" if status is not None else "status unavailable"
             lines.append(f"  {_age_label(entry, anchor):>10}  {entry.get('command', '')}")
+            lines.append(f"    {timestamp} · {entry.get('source', 'unknown')} · {result}")
         lines.append("")
         return "\n".join(lines) + "\n"
-    lines.append("Recent relevant activity")
-    lines.append("─" * 25)
-    grouped = group_by_domain(entries)
+    lines.append("Recent events")
+    lines.append("─" * 14)
+    grouped = summarize_events(entries)
     for domain, items in grouped.items():
         lines.append("")
         lines.append(domain.upper() if domain != "other" else "Other")
-        for entry in items:
-            lines.append(f"  {_age_label(entry, anchor):>10}  {entry.get('command', '')}")
-            reason = "; ".join(entry.get("reasons", [])[:2])
+        for item in items:
+            entry = item["entry"]
+            latest = item["latest"]
+            count = f"{item['count']}× " if item["count"] > 1 else ""
+            span = _age_label(latest, anchor)
+            lines.append(f"  {count}{span:>10}  {item['kind']}: {entry.get('command', '')}")
+            reason = "; ".join(entry.get("reasons", [])[:1])
             if reason:
                 lines.append(f"    Relevance: {reason}")
     lines.append("")

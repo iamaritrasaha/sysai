@@ -99,10 +99,20 @@ class SessionEnrichmentTests(unittest.TestCase):
 
 
 class AutoIncidentTests(unittest.TestCase):
-    def test_confirmed_critical_finding_is_recorded_as_incident(self):
+    def test_single_confirmed_signal_is_not_recorded_as_incident(self):
         session = Session(Config(), "/bin/true")
         document = {"request": {"scope": "gpu"}, "findings": [
             finding("gpu.temperature_high", "gpu", WARNING, CONFIRMED, title="hot gpu"),
+        ]}
+        with mock.patch("sysai.memory.record_incident") as record:
+            session._record_confirmed_incidents(document)
+        record.assert_not_called()
+
+    def test_repeated_confirmed_signal_is_recorded_as_incident(self):
+        session = Session(Config(), "/bin/true")
+        document = {"request": {"scope": "gpu"}, "findings": [
+            finding("gpu.temperature_high", "gpu", WARNING, CONFIRMED,
+                    title="hot gpu", count=2),
         ]}
         with mock.patch("sysai.memory.record_incident") as record:
             session._record_confirmed_incidents(document)

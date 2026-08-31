@@ -19,7 +19,16 @@ __sysai_last_entered=""
 __sysai_last_history_number=""
 
 __sysai_hook() {
-  command "$SYSAI_EXECUTABLE" __hook "$@" >/dev/null 2>&1
+  # SysAI hooks are internal bookkeeping, not user jobs. Temporarily turn
+  # off interactive job control so Bash cannot print completion notifications
+  # for the hook process at the user's prompt. Preserve the user's setting.
+  local had_monitor=0
+  [[ $- == *m* ]] && had_monitor=1
+  set +m
+  command "$SYSAI_EXECUTABLE" __hook "$@" </dev/null >/dev/null 2>&1
+  local hook_status=$?
+  (( had_monitor )) && set -m
+  return "$hook_status"
 }
 
 # Restores the exit status and `$_` that the interrupted shell had, so

@@ -238,6 +238,24 @@ class SessionSourceTests(unittest.TestCase):
         self.assertIsNone(entries[0]["exit_status"])
         self.assertEqual(entries[0]["source"], history.SOURCE_BASH_HISTORY)
 
+    def test_concise_history_groups_duplicate_events(self):
+        entries = [
+            {"command": "sudo apt update", "source": "bash_history", "exit_status": 0,
+             "timestamp": "2026-09-01T10:00:00+05:30", "reasons": []},
+            {"command": "sudo apt update", "source": "bash_history", "exit_status": 0,
+             "timestamp": "2026-09-01T10:05:00+05:30", "reasons": []},
+        ]
+        grouped = history.summarize_events(entries)
+        self.assertEqual(grouped["packages"][0]["count"], 2)
+
+    def test_all_history_keeps_detailed_timestamp_and_source(self):
+        text = history.render_history([{
+            "command": "dmesg", "source": "session", "exit_status": 0,
+            "timestamp": "2026-09-01T10:00:00+05:30",
+        }], 0, all_mode=True)
+        self.assertIn("2026-09-01T10:00:00+05:30", text)
+        self.assertIn("session", text)
+
 
 if __name__ == "__main__":
     unittest.main()

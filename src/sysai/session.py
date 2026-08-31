@@ -532,21 +532,32 @@ class Session:
         return "".join(parts)
 
     def _record_confirmed_incidents(self, document: dict) -> None:
-        """Deterministic-only trigger: a confirmed critical/warning finding becomes an incident.
+        """Record only corroborated serious findings as local incidents.
 
-        Never derived from model text — only from findings Python already
-        computed. Repeated findings within the dedupe window reinforce the
-        existing memory instead of accumulating duplicates.
+        A single signal can be correctly labelled CONFIRMED for the current
+        report without being enough to establish a durable incident. Require
+        repeated evidence (the collector's count) or two serious findings in
+        the same domain. This remains deterministic and never uses model text.
         """
         domain = document.get("request", {}).get("scope", "system")
+        serious = [item for item in document.get("findings", [])
+                   if item.get("severity") in (CRITICAL, WARNING)
+                   and item.get("classification") == CONFIRMED]
+        domains_with_multiple = {item.get("domain", domain) for item in serious
+                                 if sum(1 for other in serious
+                                        if other.get("domain", domain) == item.get("domain", domain)) >= 2}
         for item in document.get("findings", []):
             if item.get("severity") not in (CRITICAL, WARNING) or item.get("classification") != CONFIRMED:
                 continue
+            item_domain = item.get("domain", domain)
+            count = item.get("count")
+            if not (isinstance(count, int) and count >= 2) and item_domain not in domains_with_multiple:
+                continue
             try:
                 memory_mod.record_incident(
-                    subject=f"{domain}:{item.get('id', 'finding')}",
+                    subject=f"{item_domain}:{item.get('id', 'finding')}",
                     statement=item.get("title", "")[:500],
-                    domain=domain, confidence=item.get("confidence", "medium"),
+                    domain=item_domain, confidence=item.get("confidence", "medium"),
                     evidence_refs=[item.get("id", "")])
             except (OSError, memory_mod.MemoryError):
                 pass

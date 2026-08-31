@@ -266,6 +266,13 @@ class LifecycleTests(BashIntegrationTestCase):
             self.assertNotIn("__session", record[2:])
             self.assertNotIn(str(shell.fake), record[2:])
 
+    def test_internal_hooks_do_not_leak_job_notifications(self):
+        shell = self.session("set -m\n")
+        shell.run("echo watched")
+        output = shell.text()
+        self.assertNotIn("[", output)
+        self.assertNotIn("Done", output)
+
     def test_interrupt_reports_the_interrupt_status(self):
         shell = self.session()
         shell.send("sleep 30\n")
