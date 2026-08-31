@@ -11,7 +11,8 @@ from sysai import cli
 from sysai.config import (Config, ModelProfile, load_config, load_model_profiles,
                           save_model_profiles)
 from sysai.ollama import OllamaManager
-from sysai.providers import OpenAICompatibleProvider, provider_for
+from sysai.providers import (OpenAICompatibleProvider, provider_capabilities,
+                             provider_for)
 
 
 class ModelTests(unittest.TestCase):
@@ -44,6 +45,37 @@ class ModelTests(unittest.TestCase):
     def test_provider_routing(self):
         self.assertEqual(provider_for(Config()).name, "Ollama")
         self.assertTrue(provider_for(Config(provider="openai-compatible", model_endpoint="http://example")).remote)
+
+    def test_provider_capabilities_are_not_a_common_form(self):
+        local = provider_capabilities("ollama")
+        remote = provider_capabilities("remote-ollama")
+        api = provider_capabilities("openai-compatible")
+        self.assertFalse(local.endpoint_required or local.api_key_required or local.model_required)
+        self.assertTrue(remote.endpoint_required and remote.discovery)
+        self.assertTrue(api.endpoint_required and api.model_required)
+
+    def test_local_setup_requires_no_credentials_or_model(self):
+        with mock.patch("sysai.cli.OllamaManager.models", return_value=["qwen3:8b"]), \
+             mock.patch("builtins.input", return_value="1") as prompt:
+            self.assertEqual(cli.add_model_profile(), 0)
+        prompt.assert_called_once_with("\nSelect [1-4]: ")
+
+    def test_cloud_setup_uses_discovery_without_endpoint_or_model_prompt(self):
+        with mock.patch("sysai.cli.OllamaManager.models", return_value=["gpt-oss:120b-cloud"]), \
+             mock.patch("sysai.cli.OllamaCloudProvider") as cloud, \
+             mock.patch("builtins.input", return_value="2") as prompt:
+            cloud.return_value.manager.models.return_value = []
+            self.assertEqual(cli.add_model_profile(), 0)
+        prompt.assert_called_once_with("\nSelect [1-4]: ")
+
+    def test_remote_ollama_only_asks_for_key_after_authentication_challenge(self):
+        manager = mock.Mock()
+        manager.models_result.side_effect = [([], "authentication required"), (["qwen3:8b"], "ok")]
+        with mock.patch("sysai.cli.OllamaManager", return_value=manager), \
+             mock.patch("sysai.cli.save_model_profiles"), \
+             mock.patch("builtins.input", side_effect=["3", "http://remote:11434", "REMOTE_KEY"]) as prompt:
+            self.assertEqual(cli.add_model_profile(), 0)
+        self.assertEqual(prompt.call_count, 3)
 
     def test_remote_stream_normalizes_sse_and_sanitizes_messages(self):
         class Response:

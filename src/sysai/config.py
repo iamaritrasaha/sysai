@@ -14,6 +14,7 @@ class Config:
     provider: str = "ollama"
     model: str = "qwen3:8b"
     ollama_url: str = "http://127.0.0.1:11434"
+    ollama_auth_env: str = ""
     model_endpoint: str = ""
     api_key_env: str = "SYSAI_API_KEY"
     remote_consent: bool = False
@@ -72,7 +73,7 @@ def load_model_profiles(path: Path | None = None) -> list[ModelProfile]:
                                    api_key_env=item.get("api_key_env", ""))
         except (KeyError, TypeError):
             continue
-        if profile.id and profile.provider and profile.name and profile.base_url:
+        if profile.id and profile.provider and profile.base_url:
             result.append(profile)
     return result
 

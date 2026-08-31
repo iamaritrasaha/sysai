@@ -99,11 +99,18 @@ class OllamaManager:
             return False
 
     def models(self) -> list[str]:
+        return self.models_result()[0]
+
+    def models_result(self) -> tuple[list[str], str]:
         try:
             payload = _request(f"{self.config.ollama_url}/api/tags", timeout=2, headers=self._auth_headers())
-            return [str(item["name"]) for item in payload.get("models", []) if isinstance(item, dict) and item.get("name")]
-        except (OSError, urllib.error.URLError, json.JSONDecodeError, TypeError, KeyError):
-            return []
+            return ([str(item["name"]) for item in payload.get("models", []) if isinstance(item, dict) and item.get("name")], "ok")
+        except urllib.error.HTTPError as exc:
+            return [], "authentication required" if exc.code in (401, 403) else f"HTTP {exc.code}"
+        except (OSError, urllib.error.URLError):
+            return [], "unreachable"
+        except (json.JSONDecodeError, TypeError, KeyError):
+            return [], "malformed response"
 
     def model_available(self) -> bool:
         return self.config.model in self.models()

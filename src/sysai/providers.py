@@ -6,11 +6,36 @@ import os
 import urllib.error
 import urllib.request
 import dataclasses
+from dataclasses import dataclass
 from typing import Protocol
 
 from .config import Config
 from .ollama import OllamaCancelled, OllamaError, OllamaManager, StreamHandle
 from .privacy import sanitize
+
+
+@dataclass(frozen=True)
+class ProviderCapabilities:
+    """Configuration contract exposed to the provider setup UI."""
+    provider: str
+    label: str
+    endpoint_required: bool
+    api_key_required: bool
+    discovery: bool
+    model_required: bool
+    streaming: bool = True
+
+
+PROVIDER_CAPABILITIES = {
+    "ollama": ProviderCapabilities("ollama", "Ollama Local", False, False, True, False),
+    "ollama-cloud": ProviderCapabilities("ollama-cloud", "Ollama Cloud", False, False, True, False),
+    "remote-ollama": ProviderCapabilities("remote-ollama", "Remote Ollama", True, False, True, False),
+    "openai-compatible": ProviderCapabilities("openai-compatible", "Compatible API", True, False, False, True),
+}
+
+
+def provider_capabilities(provider: str) -> ProviderCapabilities:
+    return PROVIDER_CAPABILITIES[provider]
 
 
 class ModelProvider(Protocol):
@@ -66,12 +91,12 @@ class OpenAICompatibleProvider:
         self.api_key = os.environ.get(config.api_key_env, "")
 
     def available(self) -> bool:
-        return bool(self.endpoint and self.api_key)
+        return bool(self.endpoint)
 
     def _post(self, messages, stream, handle=None):
         if not self.endpoint:
             raise OllamaError("Remote model endpoint is not configured.")
-        if not self.api_key:
+        if self.config.api_key_env and not self.api_key:
             raise OllamaError(f"Remote API key environment variable {self.config.api_key_env} is not set.")
         # This is the final cloud boundary: local history/memory and identifiers
         # are removed even if a future caller accidentally includes them.
@@ -80,7 +105,9 @@ class OpenAICompatibleProvider:
                 "temperature": 0.2}
         request = urllib.request.Request(
             f"{self.endpoint}/chat/completions", data=json.dumps(body).encode(), method="POST",
-            headers={"Content-Type": "application/json", "Authorization": f"Bearer {self.api_key}"},
+            headers={"Content-Type": "application/json", **(
+                {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
+            )},
         )
         try:
             response = urllib.request.urlopen(request, timeout=self.config.request_timeout_seconds)
@@ -143,7 +170,7 @@ class OpenAICompatibleProvider:
 def provider_for(config: Config) -> ModelProvider:
     if config.provider.lower() in ("ollama-cloud", "ollama_cloud"):
         return OllamaCloudProvider(config)
-    if config.provider.lower() == "ollama":
+    if config.provider.lower() in ("ollama", "remote-ollama", "remote_ollama"):
         return OllamaProvider(config)
     if config.provider.lower() in ("openai", "openai-compatible", "openai_compatible", "remote"):
         return OpenAICompatibleProvider(config)

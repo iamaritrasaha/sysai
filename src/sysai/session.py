@@ -116,7 +116,7 @@ class Session:
         os.chmod(self.runtime, 0o700)
         self.socket_path = self.runtime / f"session-{os.getpid()}.sock"
         self.state_path = self.runtime / "active.json"
-        self.ollama = OllamaManager(config)
+        self.ollama = OllamaManager(config, auth_env=config.ollama_auth_env)
         self.provider = provider_for(config)
         if hasattr(self.provider, "manager"):
             self.provider.manager = self.ollama
@@ -813,7 +813,7 @@ class Session:
         if not os.isatty(0) or not os.isatty(1):
             raise RuntimeError("`sysai` must be started from an interactive terminal.")
         self._acquire_session_lock()
-        if self.config.provider == "ollama":
+        if self.config.provider in ("ollama", "remote-ollama"):
             self.ollama.ensure_ready(self.runtime)
             if not self.ollama.model_available():
                 raise OllamaError(f"Model '{self.config.model}' is not installed in Ollama. Use `sysai models` to see installed models.")

@@ -615,6 +615,7 @@ def _qualified_model(value: str) -> tuple[str, str]:
 def _profile_config(config: Config, profile: ModelProfile) -> Config:
     return dataclasses.replace(config, provider=profile.provider, model=profile.name,
                                ollama_url=profile.base_url if profile.provider == "ollama" else config.ollama_url,
+                               ollama_auth_env=profile.api_key_env if profile.provider == "ollama" else "",
                                model_endpoint=profile.base_url, api_key_env=profile.api_key_env,
                                active_model_id=profile.id)
 
@@ -622,10 +623,10 @@ def _profile_config(config: Config, profile: ModelProfile) -> Config:
 def _profile_status(profile: ModelProfile) -> tuple[bool, str]:
     candidate = _profile_config(load_config(), profile)
     if profile.provider == "ollama":
-        manager = OllamaManager(candidate)
+        manager = OllamaManager(candidate, auth_env=profile.api_key_env)
         if not manager.available():
             return False, "unreachable"
-        if profile.name not in manager.models():
+        if profile.name and profile.name not in manager.models():
             return False, "model unavailable"
         return True, profile.base_url
     provider = OpenAICompatibleProvider(candidate)
@@ -633,26 +634,55 @@ def _profile_status(profile: ModelProfile) -> tuple[bool, str]:
 
 
 def add_model_profile() -> int:
-    print("Provider\n\n  1. Local Ollama\n  2. Remote Ollama\n  3. OpenAI-compatible API")
+    print("Select provider\n\n  1. Ollama Local\n  2. Ollama Cloud\n  3. Remote Ollama\n  4. Compatible API")
     try:
-        choice = input("\nSelect [1-3]: ").strip()
-        if choice not in ("1", "2", "3"):
+        choice = input("\nSelect [1-4]: ").strip()
+        if choice not in ("1", "2", "3", "4"):
             raise ValueError
         if choice == "1":
-            endpoint, provider = "http://127.0.0.1:11434", "ollama"
+            print("✓ No configuration required.\nDiscovering models...")
+            names = OllamaManager(load_config()).models()
+            print("  " + (", ".join(names) if names else "No local models discovered."))
+            return 0
+        if choice == "2":
+            print("✓ Using Ollama Cloud authentication.\nDiscovering models...")
+            config = load_config()
+            names = [name for name in OllamaManager(config).models() if name.lower().endswith(":cloud")]
+            if os.environ.get("OLLAMA_API_KEY"):
+                names.extend(OllamaCloudProvider(config).manager.models())
+            names = list(dict.fromkeys(names))
+            print("  " + (", ".join(names) if names else "Cloud is not configured or no models are available."))
+            return 0
+        endpoint = input("Endpoint: ").strip().rstrip("/")
+        provider = "ollama" if choice == "3" else "openai-compatible"
+        api_key_env = ""
+        model = ""
+        if provider == "ollama":
+            candidate = dataclasses.replace(load_config(), ollama_url=endpoint)
+            manager = OllamaManager(candidate)
+            names, status = manager.models_result()
+            if status == "authentication required":
+                api_key_env = input("API key environment variable (optional): ").strip()
+                manager = OllamaManager(candidate, auth_env=api_key_env)
+                names, status = manager.models_result()
+            if status != "ok":
+                print(f"SysAI: could not discover remote models ({status}).", file=sys.stderr)
+                return 1
+            if not names:
+                print("SysAI: remote Ollama returned no models.", file=sys.stderr)
+                return 1
+            print("Discovered models: " + ", ".join(names))
         else:
-            endpoint = input("Endpoint: ").strip().rstrip("/")
-            provider = "ollama" if choice == "2" else "openai-compatible"
-        model = input("Model: ").strip()
-        api_key_env = "" if provider == "ollama" else input("API key environment variable: ").strip()
+            model = input("Model: ").strip()
+            api_key_env = input("API key environment variable (optional): ").strip()
     except (EOFError, KeyboardInterrupt, ValueError):
         print("SysAI: provider setup cancelled.", file=sys.stderr)
         return 1
-    if not endpoint or not model or (provider != "ollama" and not api_key_env):
-        print("SysAI: endpoint, model, and API key environment variable are required.", file=sys.stderr)
+    if not endpoint or (provider != "ollama" and not model):
+        print("SysAI: endpoint and model are required for a compatible API.", file=sys.stderr)
         return 2
     profiles = load_model_profiles()
-    prefix = "local-ollama" if choice == "1" else "remote-ollama" if choice == "2" else "api"
+    prefix = "remote-ollama" if choice == "3" else "api"
     used = {profile.id for profile in profiles}
     index, profile_id = 1, prefix
     while profile_id in used:
@@ -687,7 +717,7 @@ def models_command(action: str | None = None, model: str | None = None) -> int:
             config = _profile_config(config, profile)
         candidate = dataclasses.replace(config, provider=provider, model=name)
         if provider == "ollama":
-            manager = OllamaManager(candidate)
+            manager = OllamaManager(candidate, auth_env=candidate.ollama_auth_env)
             if not manager.available():
                 print("SysAI: Ollama is unavailable; cannot verify that model.", file=sys.stderr)
                 return 1
@@ -700,6 +730,7 @@ def models_command(action: str | None = None, model: str | None = None) -> int:
         set_config_value("provider", provider)
         set_config_value("model", name)
         set_config_value("ollama_url", candidate.ollama_url)
+        set_config_value("ollama_auth_env", candidate.ollama_auth_env)
         set_config_value("model_endpoint", candidate.model_endpoint)
         set_config_value("api_key_env", candidate.api_key_env)
         set_config_value("active_model_id", profile.id if profile else "")

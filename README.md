@@ -43,6 +43,11 @@ remote entries with `sysai models add`; keys are represented only by their
 environment-variable names. Remote/cloud models are never selected or used
 without explicit consent.
 
+Provider setup is provider-aware: local Ollama needs no form, hosted Ollama
+uses its supported authentication/discovery, remote Ollama asks for an
+endpoint and only asks for credentials after an authentication challenge,
+and compatible APIs ask for the fields they need.
+
 ## Everyday commands
 
 ```sh
