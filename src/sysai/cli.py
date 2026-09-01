@@ -522,7 +522,7 @@ def memory_command(args: list[str]) -> int:
         if not record:
             print(f"SysAI: No memory with ID {rest[0]}.", file=sys.stderr)
             return 1
-        _write(memory_mod.render_memory_list([record]))
+        _write(memory_mod.render_memory_detail(record))
         return 0
     if action == "forget":
         if not rest:
@@ -563,15 +563,40 @@ def feedback_command(args: list[str]) -> int:
         print("SysAI: Please provide feedback, e.g. `sysai feedback yes` or a short correction.",
               file=sys.stderr)
         return 2
-    if args == ["yes"]:
-        record = memory_mod.record_feedback("The previous SysAI assessment was confirmed correct.",
-                                             positive=True)
-    elif args == ["no"]:
-        record = memory_mod.record_feedback("The previous SysAI assessment was reported incorrect.",
-                                             positive=False)
+    try:
+        if args == ["yes"]:
+            result = memory_mod.apply_feedback("yes")
+        elif args == ["no"]:
+            result = memory_mod.apply_feedback("no")
+        else:
+            result = memory_mod.apply_feedback("correction", correction=" ".join(args))
+    except memory_mod.MemoryError as exc:
+        print(f"SysAI: {exc}", file=sys.stderr)
+        return 2
+    if result is None:
+        print("SysAI: There is no recent SysAI assessment to confirm.", file=sys.stderr)
+        return 1
+    if result["verdict"] == "correction":
+        print(f"SysAI: correction linked to assessment {result['assessment']['assessment_id']}.")
     else:
-        record = memory_mod.record_feedback(" ".join(args))
-    print(f"SysAI: recorded feedback [{record['id']}].")
+        print(f"SysAI: feedback linked to assessment {result['assessment']['assessment_id']}.")
+    return 0
+
+
+def resolved_command(text: str) -> int:
+    text = " ".join(str(text).split())
+    if not text:
+        print("SysAI: Please describe the reported resolution.", file=sys.stderr)
+        return 2
+    try:
+        outcome = memory_mod.resolve_latest(text)
+    except memory_mod.MemoryError as exc:
+        print(f"SysAI: {exc}", file=sys.stderr)
+        return 2
+    if outcome is None:
+        print("SysAI: No recent incident assessment is available to resolve.", file=sys.stderr)
+        return 1
+    print(f"SysAI: outcome [{outcome['id']}] linked to the latest incident assessment.")
     return 0
 
 
@@ -595,12 +620,9 @@ def context_command() -> int:
     lines.append("Relevant history")
     lines.append(f"  {len(entries)} event(s), {ignored} ignored as unrelated")
     lines.append("")
-    lines.append("Memory")
-    lines.append(f"  {mem_stats['total']} total")
-    for type_ in memory_mod.TYPES:
-        count = mem_stats["by_type"].get(type_, 0)
-        if count:
-            lines.append(f"    {type_}: {count}")
+    lines.append("Experience")
+    lines.append(f"  {mem_stats['by_type'].get('incident', 0)} incidents · {mem_stats['by_type'].get('outcome', 0)} outcomes")
+    lines.append(f"  {mem_stats['patterns']} recurring patterns · {mem_stats['assessments']} assessments")
     _write("\n".join(lines) + "\n")
     return 0
 
@@ -856,7 +878,7 @@ def select_model() -> Config | None:
 RESERVED = {
     "explain", "investigate", "ask", "check", "health", "doctor", "what", "report",
     "baseline", "changes", "watch", "update", "thinking", "stop",
-    "history", "memories", "remember", "feedback", "context",
+    "history", "memories", "remember", "feedback", "resolved", "context",
     *DOMAINS, "models", "--model", "--help", "-h", "--version",
 }
 
@@ -947,6 +969,9 @@ def build_parser() -> argparse.ArgumentParser:
     feedback_parser = sub.add_parser("feedback", help="confirm, reject, or correct the last assessment")
     feedback_parser.add_argument("text", nargs="+")
 
+    resolved_parser = sub.add_parser("resolved", help="record a user-reported outcome for the latest incident")
+    resolved_parser.add_argument("text", nargs="+")
+
     sub.add_parser("context", help="what SysAI currently knows, without dumping data")
     return parser
 
@@ -1028,6 +1053,8 @@ def main(argv: list[str] | None = None) -> int:
         return remember_command(" ".join(args.text))
     if args.command == "feedback":
         return feedback_command(args.text)
+    if args.command == "resolved":
+        return resolved_command(" ".join(args.text))
     if args.command == "context":
         return context_command()
     if os.environ.get("SYSAI_SESSION"):
@@ -1035,9 +1062,10 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     config = launch_config
     if config is None:
-        config = select_model()
-        if config is None:
-            return 1
+        # A saved/default backend is the normal fast path. Selection remains
+        # explicit through `sysai --model`, and an unavailable default is
+        # reported plainly rather than silently switching providers.
+        config = load_config()
     if config.provider != "ollama" and not config.remote_consent:
         print("Remote model selected.\n\nSanitized diagnostic context may be sent to a remote service.\n"
               "Local Bash history and private memory remain on this machine.\n")

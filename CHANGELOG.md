@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Rebuilt local experience learning around stable incident fingerprints, cross-session occurrences, conservative recurring patterns, machine-fact supersession, lightweight assessment-linked feedback, and user-reported outcomes. Existing v1 memory databases migrate transactionally without deleting user records. History now classifies command semantics rather than treating arbitrary arguments as diagnostic evidence.
 - Startup model selection now discovers local/remote choices, keeps the saved model as the default, and supports hosted Ollama models with explicit consent.
 - Multi-provider model selection with automatic local Ollama discovery, a provider abstraction, optional OpenAI-compatible remote providers, and explicit cloud consent. Bash history and memory remain local and no provider fallback is performed.
 

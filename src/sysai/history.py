@@ -10,6 +10,7 @@ never executed or interpreted as shell syntax, here or anywhere downstream.
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import os
 import re
 import shlex
@@ -64,6 +65,13 @@ _MODIFYING_COMMANDS = frozenset({
     "dpkg", "snap", "flatpak", "update-grub", "grub-mkconfig", "update-initramfs",
     "mount", "umount", "fsck", "mkfs", "parted", "fdisk", "nmcli", "sysctl", "swapon",
     "swapoff", "iptables", "nft", "ufw",
+})
+
+_WRAPPERS = frozenset({"sudo", "doas", "env", "command", "time", "nohup"})
+_SEMANTIC_ARGUMENT_COMMANDS = frozenset({
+    "apt", "apt-get", "nala", "dpkg", "snap", "flatpak", "modprobe", "rmmod", "insmod",
+    "systemctl", "service", "nmcli", "mount", "umount", "fsck", "mkfs", "parted", "fdisk",
+    "swapon", "swapoff", "iptables", "nft", "ufw", "reboot", "shutdown",
 })
 
 _BASH_HISTORY_TIMESTAMP = re.compile(r"^#(\d+)$")
@@ -242,6 +250,68 @@ def _tokens(command: str) -> list[str]:
     return tokens
 
 
+def _command_parts(command: str) -> tuple[str, list[str]]:
+    """Find the real executable beneath harmless shell wrappers, never executing text."""
+    try:
+        parts = shlex.split(command, comments=False)
+    except ValueError:
+        return "", []
+    index = 0
+    while index < len(parts):
+        token = Path(parts[index]).name.lower()
+        if token in _WRAPPERS:
+            index += 1
+            # `sudo -n`, `env NAME=value`, and `time -p` are wrappers too.
+            while index < len(parts) and (parts[index].startswith("-") or "=" in parts[index]):
+                index += 1
+            continue
+        if "=" in parts[index] and not parts[index].startswith("/"):
+            index += 1
+            continue
+        return token, [Path(value).name.lower() if "/" in value else value.lower() for value in parts[index + 1:]]
+    return "", []
+
+
+def _semantic_tokens(command: str) -> list[str]:
+    program, arguments = _command_parts(command)
+    if not program:
+        return []
+    # Path/string arguments are intentionally ignored for arbitrary commands:
+    # `grep gpu README` and `cd ~/gpu-demo` are not GPU diagnostic events.
+    return [program, *arguments] if program in _SEMANTIC_ARGUMENT_COMMANDS else [program]
+
+
+def classify_event(entry: dict) -> str:
+    """Small, explainable command-semantic taxonomy for the history timeline."""
+    program, arguments = _command_parts(entry.get("command", ""))
+    if entry.get("exit_status") not in (None, 0):
+        return "failure"
+    if program in ("reboot", "shutdown"):
+        return "reboot"
+    if program in ("apt", "apt-get", "nala"):
+        action = arguments[0] if arguments else ""
+        if action in ("upgrade", "full-upgrade", "dist-upgrade", "install", "remove", "purge", "autoremove"):
+            return "package_change"
+        if action in ("update", "search", "show", "policy", "list"):
+            return "inspection"
+    if program in ("systemctl", "service"):
+        action = arguments[0] if arguments else ""
+        return "inspection" if action in ("status", "is-active", "show", "list-units") else "service_change"
+    if program in ("modprobe", "rmmod", "insmod"):
+        return "driver_change"
+    if program in ("mount", "umount", "fsck", "mkfs", "parted", "fdisk"):
+        return "filesystem_change"
+    if program in ("nmcli", "ip", "resolvectl", "iptables", "nft", "ufw"):
+        return "network_change"
+    return "inspection" if program in COMMAND_FAMILY_DOMAIN else "unrelated"
+
+
+def event_fingerprint(entry: dict) -> str:
+    program, arguments = _command_parts(entry.get("command", ""))
+    material = "|".join((classify_event(entry), program, " ".join(arguments[:3])))
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:20]
+
+
 # Command Insight's approved read-only inspection commands, mapped to the
 # diagnostic domain whose history/memory context is relevant to them.
 COMMAND_FAMILY_DOMAIN: dict[str, str] = {
@@ -273,7 +343,7 @@ def command_domain(command: str) -> str | None:
     command that matches no domain vocabulary gets neither, rather than
     guessing.
     """
-    tokens = set(_tokens(command))
+    tokens = set(_semantic_tokens(command))
     if not tokens:
         return None
     best, best_count = None, 0
@@ -343,7 +413,7 @@ def _entry_time(entry: dict) -> dt.datetime | None:
 
 def score_entry(entry: dict, domain: str, *, anchor_time: dt.datetime | None = None) -> tuple[float, list[str]]:
     """Deterministic relevance score in [0, 1] with human-readable reasons."""
-    tokens = _tokens(entry.get("command", ""))
+    tokens = _semantic_tokens(entry.get("command", ""))
     reasons: list[str] = []
     score = 0.0
 
@@ -435,6 +505,7 @@ def correlation_block(entries: list[dict], ignored_count: int) -> dict:
         "entries": [
             {"timestamp": e.get("timestamp"), "command": e.get("command"),
              "source": e.get("source"), "exit_status": e.get("exit_status"),
+             "fingerprint": event_fingerprint(e), "event_class": classify_event(e),
              "relevance_score": e.get("relevance_score"), "reasons": e.get("reasons", [])}
             for e in entries
         ],
@@ -447,7 +518,7 @@ def correlation_block(entries: list[dict], ignored_count: int) -> dict:
 def group_by_domain(entries: list[dict]) -> dict[str, list[dict]]:
     grouped: dict[str, list[dict]] = {}
     for entry in entries:
-        tokens = _tokens(entry.get("command", ""))
+        tokens = _semantic_tokens(entry.get("command", ""))
         matched_domain = None
         for domain in DOMAIN_TERMS:
             if _domain_hits(tokens, domain):
@@ -458,18 +529,12 @@ def group_by_domain(entries: list[dict]) -> dict[str, list[dict]]:
 
 
 def _event_key(entry: dict) -> tuple[str, int | None]:
-    """Stable key for collapsing repeated commands in the human view."""
-    command = " ".join(str(entry.get("command") or "").split())
-    return (command, entry.get("exit_status"))
+    """Stable semantic key for collapsing equivalent terminal events."""
+    return (event_fingerprint(entry), entry.get("exit_status"))
 
 
 def _event_kind(entry: dict) -> str:
-    tokens = _tokens(entry.get("command", ""))
-    if entry.get("exit_status") not in (None, 0):
-        return "failure"
-    if _is_modifying(tokens):
-        return "change"
-    return "check"
+    return classify_event(entry).replace("_", " ")
 
 
 def summarize_events(entries: list[dict]) -> dict[str, list[dict]]:
@@ -489,6 +554,7 @@ def summarize_events(entries: list[dict]) -> dict[str, list[dict]]:
             current_time = _entry_time(entry)
             if current_time is not None and (latest_time is None or current_time > latest_time):
                 summary["latest"] = entry
+                summary["entry"] = entry
         grouped[domain] = sorted(summaries.values(),
                                  key=lambda item: _entry_time(item["latest"]) or
                                  dt.datetime.min.replace(tzinfo=dt.timezone.utc),
@@ -543,7 +609,7 @@ def render_history(entries: list[dict], ignored_count: int, *, all_mode: bool = 
             latest = item["latest"]
             count = f"{item['count']}× " if item["count"] > 1 else ""
             span = _age_label(latest, anchor)
-            lines.append(f"  {count}{span:>10}  {item['kind']}: {entry.get('command', '')}")
+            lines.append(f"  {count}{span:>10}  {item['kind'].upper()}: {entry.get('command', '')}")
             reason = "; ".join(entry.get("reasons", [])[:1])
             if reason:
                 lines.append(f"    Relevance: {reason}")

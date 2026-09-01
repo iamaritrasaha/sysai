@@ -177,6 +177,14 @@ class DoctorTests(unittest.TestCase):
         self.assertNotIn("_ask_local", source)
         self.assertNotIn("stream_chat", source)
 
+    def test_experience_store_is_checked_without_creating_one(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "memory.db"
+            with mock.patch("sysai.doctor.memory.store_path", return_value=path):
+                checks = doctor._experience_checks()
+        self.assertEqual(checks[0]["status"], doctor.INFO)
+        self.assertFalse(path.exists())
+
     def test_full_run_produces_a_renderable_report(self):
         result = doctor.run_doctor(probe_model=False)
         text = doctor.render_doctor(result)

@@ -31,6 +31,24 @@ class TokenMatchingTests(unittest.TestCase):
         tokens = history._tokens("sudo systemctl restart NetworkManager")
         self.assertTrue(history._domain_hits(tokens, "system"))
 
+    def test_path_and_grep_arguments_are_not_treated_as_diagnostic_events(self):
+        self.assertIsNone(history.command_domain("cd ~/Projects/gpu-demo"))
+        self.assertIsNone(history.command_domain("grep gpu README.md"))
+
+    def test_wrapped_real_executable_is_classified(self):
+        self.assertEqual(history.command_domain("sudo env LANG=C modprobe amdgpu"), "gpu")
+
+    def test_history_semantics_distinguish_inspection_and_change(self):
+        self.assertEqual(history.classify_event({"command": "apt update", "exit_status": 0}), "inspection")
+        self.assertEqual(history.classify_event({"command": "apt upgrade", "exit_status": 0}), "package_change")
+        self.assertEqual(history.classify_event({"command": "systemctl status nginx", "exit_status": 0}), "inspection")
+        self.assertEqual(history.classify_event({"command": "systemctl restart nginx", "exit_status": 0}), "service_change")
+
+    def test_wrapped_equivalent_commands_share_an_event_fingerprint(self):
+        direct = {"command": "apt update", "exit_status": 0}
+        wrapped = {"command": "sudo apt update", "exit_status": 0}
+        self.assertEqual(history.event_fingerprint(direct), history.event_fingerprint(wrapped))
+
 
 class BashHistoryParsingTests(unittest.TestCase):
     def test_parses_epoch_timestamp_pairs(self):

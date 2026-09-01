@@ -1,16 +1,16 @@
 # SysAI — Local Linux Intelligence
 
 SysAI is a Bash-native Linux intelligence and diagnostic environment. It
-inspects system evidence, correlates relevant history, remembers local
-incidents, investigates failures, and explains what it finds through a model
-you choose at startup.
+inspects system evidence, correlates relevant history, learns from local
+machine experience, investigates failures, and explains what it finds through
+the configured model.
 
 It provides:
 
 - deterministic, read-only diagnostics, health, doctor, and investigation
 - safe Command Insight for allowlisted commands
-- bounded Bash-history correlation and local experience memory
-- startup selection for local Ollama, remote Ollama, hosted Ollama models,
+- bounded Bash-history correlation and a local Experience Engine
+- local Ollama, remote Ollama, hosted Ollama models,
   and optional compatible remote APIs
 - explicit remote consent, shared privacy filtering, and no provider fallback
 
@@ -21,8 +21,10 @@ It provides:
 sysai
 ```
 
-The startup screen discovers available models, marks the saved default, and
-lets Enter accept it. With one model, Enter continues immediately.
+SysAI normally starts with the saved/default model. Use `sysai --model` to
+reopen the selector or `sysai --model MODEL` for a non-interactive launch.
+
+An explicit selector looks like:
 
 ```text
 SysAI
@@ -37,8 +39,7 @@ LOCAL
 Select [1]:
 ```
 
-Use `sysai --model` to reopen the selector or `sysai --model MODEL` for a
-non-interactive launch. Local Ollama is the default. Configure additional
+Local Ollama is the default. Configure additional
 remote entries with `sysai models add`; keys are represented only by their
 environment-variable names. Remote/cloud models are never selected or used
 without explicit consent.
@@ -61,7 +62,25 @@ sysai what "sudo apt autoremove"
 
 Advanced configuration inspection is available through `sysai models`.
 Useful local data commands include `sysai history`, `sysai memories`,
-`sysai remember`, `sysai baseline`, and `sysai report`.
+`sysai remember`, `sysai feedback`, `sysai resolved`, `sysai baseline`, and
+`sysai report`.
+
+## Learns from experience
+
+SysAI does not retrain the language model. It improves through structured,
+local experience: stable machine facts, deterministic incident occurrences,
+confirmed outcomes, user corrections, and conservative recurring patterns.
+
+One warning is not a pattern. Automatic incidents use stable finding
+fingerprints and independent session counts; patterns require repeated
+sessions and always describe a recurring association, never an unsupported
+cause. `sysai feedback yes|no` attaches to the latest assessment rather than
+creating a generic note. `sysai resolved "..."` records a user-reported
+outcome linked to the latest incident when one exists.
+
+`sysai memories` provides the operational view, while `sysai memories show ID`
+explains a record’s source, observations, status, evidence identifiers, and
+whether it can influence future diagnostic context.
 
 ## Safety and privacy
 

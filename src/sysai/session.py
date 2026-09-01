@@ -17,6 +17,7 @@ import socket
 import tempfile
 import termios
 import threading
+import uuid
 from pathlib import Path
 
 from .config import Config, load_private_env, state_dir
@@ -122,6 +123,10 @@ class Session:
             self.provider.manager = self.ollama
         self.records: collections.deque[dict] = collections.deque(maxlen=config.context_commands)
         self.discussion: collections.deque[dict[str, str]] = collections.deque(maxlen=8)
+        # A bounded troubleshooting identity, not a transcript. It lets the
+        # local experience store distinguish independent recurrences.
+        self.session_id = f"s-{uuid.uuid4().hex}"
+        self.last_assessment_id: str | None = None
         self.current: dict | None = None
         self.current_output = bytearray()
         # Last completed diagnostic evidence document, for `sysai report --last`
@@ -405,6 +410,17 @@ class Session:
                 sections=insight_sections,
                 diagnostics=evidence.get("additional_diagnostics", []),
                 arguments={"argv": argv})
+            try:
+                assessment = memory_mod.record_assessment(
+                    domain=domain, finding_ids=[signal.get("kind", "") for signal in evidence.get("signals", []) if signal.get("kind")],
+                    memory_ids=[item["id"] for item in (memory_block or {}).get("memories", [])],
+                    history_fingerprints=[item.get("fingerprint", "") for item in (history_block or {}).get("entries", []) if item.get("fingerprint")],
+                    diagnostics_collected=bool(diagnostics),
+                )
+                self.last_assessment_id = assessment["assessment_id"]
+                self.last_result["assessment_id"] = assessment["assessment_id"]
+            except (OSError, memory_mod.MemoryError):
+                pass
             prompt = "The command was explicitly requested by the user and executed by SysAI. Analyze only supplied evidence; do not invent system state or execute commands. " \
                 "The supplied evidence was intentionally truncated by SysAI when output_truncated is true. This is NOT evidence that the operating system, boot process, kernel, command, or log itself was truncated or failed. " \
                 "Normal hardware/firmware enumeration, AppArmor enforcement, service startup, and device discovery are informational unless supplied evidence explicitly indicates failure. Keyword matches alone are not proof. " \
@@ -449,9 +465,28 @@ class Session:
                     send({"type": "progress", "text": f"• Web research unavailable: {exc}\n"})
                 else:
                     research = research_block(results)
-        # Kept in memory only, for `sysai report --last` and `sysai investigate`.
-        self.last_result = document
-        self._record_confirmed_incidents(document)
+        retrieved = (document.get("sections", {}).get("prior_experience", {}) or {}).get("memories", [])
+        history_entries = (document.get("sections", {}).get("history_correlation", {}) or {}).get("entries", [])
+        assessment_id = ""
+        try:
+            assessment = memory_mod.record_assessment(
+                domain=document.get("request", {}).get("scope", "system"),
+                finding_ids=[item.get("id", "") for item in document.get("findings", []) if item.get("id")],
+                memory_ids=[item.get("id", "") for item in retrieved if item.get("id")],
+                history_fingerprints=[item.get("fingerprint", "") for item in history_entries if item.get("fingerprint")],
+                severity_summary={item.get("severity", "informational"): sum(1 for other in document.get("findings", []) if other.get("severity") == item.get("severity")) for item in document.get("findings", [])},
+                diagnostics_collected=bool(document.get("diagnostics")),
+            )
+            assessment_id = assessment["assessment_id"]
+            self.last_assessment_id = assessment_id
+            incident_ids = self._record_confirmed_incidents(document, assessment_id=assessment_id)
+            memory_mod.learn_machine_facts(document, session_id=self.session_id)
+            memory_mod.update_assessment_memories(assessment_id, [*([item.get("id", "") for item in retrieved]), *incident_ids])
+        except (OSError, memory_mod.MemoryError):
+            pass
+        # Kept in process memory only for report/investigate; the assessment
+        # database stores metadata, never the model answer or raw evidence.
+        self.last_result = {**document, **({"assessment_id": assessment_id} if assessment_id else {})}
         prompt = assessment_prompt(document, research, catalogue=json.dumps(action_catalogue()))
         self._stream_answer(prompt, send, handle, remember_question=None)
 
@@ -497,7 +532,7 @@ class Session:
         use never touches the history file or the memory database.
         """
         domain = document.get("request", {}).get("scope", "system")
-        keywords = [item.get("id", "").split(".")[0] for item in document.get("findings", [])]
+        keywords = [item.get("id", "") for item in document.get("findings", []) if item.get("id")]
         history_block, memory_block = self._gather_correlation(domain, keywords=keywords)
         if history_block is None and memory_block is None:
             return document
@@ -531,7 +566,7 @@ class Session:
                 "just now:\n" + json.dumps(memory_block, sort_keys=True))
         return "".join(parts)
 
-    def _record_confirmed_incidents(self, document: dict) -> None:
+    def _record_confirmed_incidents(self, document: dict, *, assessment_id: str = "") -> list[str]:
         """Record only corroborated serious findings as local incidents.
 
         A single signal can be correctly labelled CONFIRMED for the current
@@ -546,6 +581,7 @@ class Session:
         domains_with_multiple = {item.get("domain", domain) for item in serious
                                  if sum(1 for other in serious
                                         if other.get("domain", domain) == item.get("domain", domain)) >= 2}
+        recorded: list[str] = []
         for item in document.get("findings", []):
             if item.get("severity") not in (CRITICAL, WARNING) or item.get("classification") != CONFIRMED:
                 continue
@@ -554,13 +590,16 @@ class Session:
             if not (isinstance(count, int) and count >= 2) and item_domain not in domains_with_multiple:
                 continue
             try:
-                memory_mod.record_incident(
+                incident = memory_mod.record_incident(
                     subject=f"{item_domain}:{item.get('id', 'finding')}",
                     statement=item.get("title", "")[:500],
                     domain=item_domain, confidence=item.get("confidence", "medium"),
-                    evidence_refs=[item.get("id", "")])
+                    evidence_refs=[item.get("id", "")], finding_id=item.get("id", ""),
+                    session_id=self.session_id, assessment_id=assessment_id)
+                recorded.append(incident["id"])
             except (OSError, memory_mod.MemoryError):
                 pass
+        return recorded
 
     def _investigation_subject(self) -> dict | None:
         """The most recent meaningful failed command, or the last serious finding."""
@@ -774,6 +813,14 @@ class Session:
                 # a typo or one-off failure with no domain match adds nothing,
                 # preserving the normal (no history/memory) analysis path.
                 domain = history_mod.command_domain(record.get("command", ""))
+                if domain is not None:
+                    try:
+                        assessment = memory_mod.record_assessment(
+                            domain=domain, finding_ids=[], memory_ids=[], history_fingerprints=[],
+                            severity_summary={"failure": 1}, diagnostics_collected=False)
+                        self.last_assessment_id = assessment["assessment_id"]
+                    except (OSError, memory_mod.MemoryError):
+                        pass
                 prompt += self._correlation_prompt_text(domain, keywords=[domain] if domain else None)
                 answer = self._ask_local(
                     prompt, on_thinking=renderer.thinking, on_content=renderer.content, handle=handle,

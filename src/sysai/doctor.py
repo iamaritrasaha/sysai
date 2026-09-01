@@ -20,6 +20,7 @@ from . import __version__
 from .collect import have, read_text, run
 from .config import Config, config_dir, load_config, load_private_env
 from .display import ANSI_RE, AnswerRenderer
+from . import memory
 
 OK = "ok"
 ATTENTION = "attention"
@@ -219,6 +220,25 @@ def _config_checks(config: Config) -> list[dict]:
     return checks
 
 
+def _experience_checks() -> list[dict]:
+    """Read the local experience store only; never consult a model or provider."""
+    try:
+        path = memory.store_path()
+    except (OSError, memory.MemoryError) as exc:
+        return [_check("experience.store", "Experience store", ATTENTION, str(exc))]
+    if not path.exists():
+        return [_check("experience.store", "Experience store", INFO, "not created yet")]
+    try:
+        data = memory.stats()
+    except (OSError, memory.MemoryError) as exc:
+        return [_check("experience.store", "Experience store", ATTENTION, str(exc))]
+    mode = _mode(path)
+    status = OK if mode is not None and not mode & 0o077 else ATTENTION
+    detail = (f"schema v{data['schema_version']}, {data['total']} records, {data['assessments']} assessments"
+              + (f" (mode {mode:04o})" if mode is not None else ""))
+    return [_check("experience.store", "Experience store", status, detail)]
+
+
 def _ollama_checks(config: Config, probe_model: bool = True) -> list[dict]:
     checks = []
     checks.append(_check("ollama.binary", "Ollama binary",
@@ -348,6 +368,7 @@ def run_doctor(config: Config | None = None, *, probe_model: bool = True) -> dic
     checks += _bash_checks()
     checks += _install_checks()
     checks += _config_checks(config)
+    checks += _experience_checks()
     checks += _ollama_checks(config, probe_model=probe_model)
     checks += _runtime_checks()
     checks.append(_gpu_check())

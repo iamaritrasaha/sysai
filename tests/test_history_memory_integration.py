@@ -139,6 +139,21 @@ class AutoIncidentTests(unittest.TestCase):
             session._record_confirmed_incidents(document)
         run.assert_not_called()
 
+    def test_assessment_metadata_tracks_incident_without_model_answer(self):
+        session = Session(Config(), "/bin/true")
+        document = {"request": {"scope": "gpu"}, "sections": {}, "diagnostics": [], "findings": [
+            finding("gpu.kernel_events", "gpu", WARNING, CONFIRMED, title="GPU warnings", count=2),
+        ]}
+        with tempfile.TemporaryDirectory() as temp, _isolated_memory(temp), \
+             mock.patch.object(session, "_adaptive_diagnostics", return_value=[]), \
+             mock.patch.object(session, "_stream_answer"):
+            session._assess(document, None, lambda _message: None, mock.Mock(), rounds=0)
+            assessment = memory.latest_assessment()
+            incident = memory.list_memories(type="incident")[0]
+        self.assertEqual(assessment["finding_ids"], ["gpu.kernel_events"])
+        self.assertIn(incident["id"], assessment["memory_ids"])
+        self.assertNotIn("answer", assessment)
+
 
 class PerformanceTests(unittest.TestCase):
     """An ordinary completed shell command must never touch history or memory."""
@@ -213,6 +228,25 @@ class CliCommandTests(unittest.TestCase):
             status = cli.context_command()
         self.assertEqual(status, 0)
         self.assertIn("SysAI Context", out.getvalue())
+
+    def test_feedback_without_an_assessment_creates_no_memory(self):
+        with tempfile.TemporaryDirectory() as temp, _isolated_memory(temp), \
+             mock.patch("sys.stderr", new_callable=io.StringIO):
+            status = cli.feedback_command(["yes"])
+            total = memory.stats()["total"]
+        self.assertEqual(status, 1)
+        self.assertEqual(total, 0)
+
+    def test_resolved_command_links_a_user_outcome(self):
+        with tempfile.TemporaryDirectory() as temp, _isolated_memory(temp), \
+             mock.patch("sys.stdout", new_callable=io.StringIO):
+            incident = memory.record_incident("gpu:gpu.kernel_events", "GPU warnings", domain="gpu",
+                                              finding_id="gpu.kernel_events", session_id="s-1")
+            memory.record_assessment(domain="gpu", memory_ids=[incident["id"]])
+            status = cli.resolved_command("Replacing the HDMI cable resolved it.")
+            outcome_count = memory.stats()["by_type"].get("outcome", 0)
+        self.assertEqual(status, 0)
+        self.assertEqual(outcome_count, 1)
 
 
 class DomainDetectionTests(unittest.TestCase):

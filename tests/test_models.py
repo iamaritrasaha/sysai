@@ -117,11 +117,12 @@ class ModelTests(unittest.TestCase):
             # No active tty is required until Session.run, which is mocked.
             self.assertEqual(cli.main(["--model"]), 0)
 
-    def test_normal_startup_uses_the_selector_and_default(self):
-        with mock.patch("sysai.cli.select_model", return_value=Config(model="llama3:3b")), \
+    def test_normal_startup_uses_the_saved_default_without_a_selector(self):
+        with mock.patch("sysai.cli.select_model") as selector, \
              mock.patch("sysai.cli.Session.run", return_value=0) as run:
             self.assertEqual(cli.main([]), 0)
             run.assert_called_once()
+            selector.assert_not_called()
 
     def test_selector_enter_chooses_marked_default_and_explains_remote_setup(self):
         output = io.StringIO()
